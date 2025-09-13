@@ -117,11 +117,30 @@ async def status(message: types.Message):
         f"Успешных отправок: {diag.get('success_sends')}",
         f"Неуспешных отправок: {diag.get('failed_sends')}",
         f"Последняя ошибка: {diag.get('last_error') or '—'}",
+        f"last_paste_strategy: {diag.get('last_paste_strategy') or '—'}",
+        f"last_copy_method: {diag.get('last_copy_method') or '—'}",
+        f"last_copy_length: {diag.get('last_copy_length')}",
+        f"last_copy_is_echo: {diag.get('last_copy_is_echo')}",
+        f"response_wait_loops: {diag.get('response_wait_loops')}",
+        f"response_ready_time: {diag.get('response_ready_time')}s",
+        f"response_stabilized: {diag.get('response_stabilized')}",
+        f"last_ui_button: {diag.get('last_ui_button')}",
+        f"last_ui_avg_color: {diag.get('last_ui_avg_color')}",
         "",
         "Параметры:",
         f"RESPONSE_WAIT_SECONDS={diag.get('RESPONSE_WAIT_SECONDS')}",
+        f"RESPONSE_MAX_WAIT_SECONDS={diag.get('RESPONSE_MAX_WAIT_SECONDS')}",
+        f"RESPONSE_POLL_INTERVAL_SECONDS={diag.get('RESPONSE_POLL_INTERVAL_SECONDS')}",
+        f"RESPONSE_STABLE_MIN_SECONDS={diag.get('RESPONSE_STABLE_MIN_SECONDS')}",
         f"PASTE_RETRY_COUNT={diag.get('PASTE_RETRY_COUNT')}",
         f"COPY_RETRY_COUNT={diag.get('COPY_RETRY_COUNT')}",
+        f"USE_UI_BUTTON_DETECTION={os.getenv('USE_UI_BUTTON_DETECTION')}",
+        f"SEND_BTN_REGION_RIGHT={os.getenv('SEND_BTN_REGION_RIGHT')}",
+        f"SEND_BTN_REGION_BOTTOM={os.getenv('SEND_BTN_REGION_BOTTOM')}",
+        f"SEND_BTN_REGION_W={os.getenv('SEND_BTN_REGION_W')}",
+        f"SEND_BTN_REGION_H={os.getenv('SEND_BTN_REGION_H')}",
+        f"SEND_BTN_BLUE_DELTA={os.getenv('SEND_BTN_BLUE_DELTA')}",
+        f"SEND_BTN_WHITE_BRIGHT={os.getenv('SEND_BTN_WHITE_BRIGHT')}",
         "",
         "AI:",
         f"Gemini модель: {ai_processor.get_model_name() or '—'}",
@@ -498,15 +517,34 @@ async def handle_message(message: types.Message):
                 "❌ Ошибка при отправке сообщения\n"
                 f"Причина: {reason}\n"
                 f"Платформа: {diag.get('platform')}\n"
-                f"Windsurf процессов: {len(diag.get('windsurf_pids', []))}",
+                f"Windsurf процессов: {len(diag.get('windsurf_pids', []))}\n"
+                f"last_paste_strategy: {diag.get('last_paste_strategy')}\n"
+                f"last_copy_method: {diag.get('last_copy_method')}\n"
+                f"last_copy_length: {diag.get('last_copy_length')}\n"
+                f"last_copy_is_echo: {diag.get('last_copy_is_echo')}\n"
+                f"response_wait_loops: {diag.get('response_wait_loops')}\n"
+                f"response_ready_time: {diag.get('response_ready_time')}s\n"
+                f"response_stabilized: {diag.get('response_stabilized')}\n"
+                f"last_ui_button: {diag.get('last_ui_button')}\n"
+                f"last_ui_avg_color: {diag.get('last_ui_avg_color')}",
                 reply_markup=main_keyboard,
             )
             return
 
-        # Получаем скопированный ответ из буфера обмена (локально) или из удаленного ответа
-        if copied_response is None:
+        # Получаем скопированный ответ:
+        # - в удаленном режиме НЕ используем локальный буфер обмена как fallback, доверяем полю response от контроллера
+        # - в локальном режиме берем из буфера
+        if copied_response is None and not REMOTE_CONTROLLER_URL:
             import pyperclip
             copied_response = pyperclip.paste()
+
+        # Фильтрация эхо: если diag говорит, что это эхо, не отправляем
+        response_is_echo = False
+        try:
+            if isinstance(diag, dict) and (diag.get("response_is_echo") or diag.get("last_copy_is_echo")):
+                response_is_echo = True
+        except Exception:
+            pass
         # Сообщение о fallback: если не удалось получить короткий ответ и применили полное копирование
         prefix_note = ""
         try:
@@ -515,14 +553,18 @@ async def handle_message(message: types.Message):
         except Exception:
             pass
 
-        if copied_response and copied_response.strip():
+        if (copied_response and copied_response.strip()) and not response_is_echo:
             await message.answer(
                 f"✅ Ответ от Windsurf:\n\n{prefix_note}{copied_response}",
                 reply_markup=main_keyboard,
             )
         else:
+            echo_note = "\nПричина: получено эхо исходного запроса — ответа еще нет." if response_is_echo else ""
+            hint = (
+                "Попробуйте: увеличить RESPONSE_WAIT_SECONDS, повторить запрос, или сфокусировать окно Windsurf."
+            )
             await message.answer(
-                "⚠️ Ответ не удалось получить из буфера обмена. Попробуйте еще раз или проверьте, что окно Windsurf активно.",
+                f"⚠️ Ответ не удалось получить из буфера обмена.{echo_note}\n{hint}",
                 reply_markup=main_keyboard,
             )
 

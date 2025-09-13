@@ -52,7 +52,17 @@ PASTE_RETRY_COUNT = _env_int("PASTE_RETRY_COUNT", 2)
 COPY_RETRY_COUNT = _env_int("COPY_RETRY_COUNT", 2)
 RESPONSE_WAIT_SECONDS = _env_float("RESPONSE_WAIT_SECONDS", 7.0)
 KEY_DELAY_SECONDS = _env_float("KEY_DELAY_SECONDS", 0.2)
+RESPONSE_MAX_WAIT_SECONDS = _env_float("RESPONSE_MAX_WAIT_SECONDS", 45.0)
+RESPONSE_POLL_INTERVAL_SECONDS = _env_float("RESPONSE_POLL_INTERVAL_SECONDS", 0.8)
+RESPONSE_STABLE_MIN_SECONDS = _env_float("RESPONSE_STABLE_MIN_SECONDS", 1.6)
 USE_APPLESCRIPT_ON_MAC = os.getenv("USE_APPLESCRIPT_ON_MAC", "1") not in ("0", "false", "False")
+USE_UI_BUTTON_DETECTION = os.getenv("USE_UI_BUTTON_DETECTION", "0") not in ("0", "false", "False")
+SEND_BTN_REGION_RIGHT = _env_int("SEND_BTN_REGION_RIGHT", 84)
+SEND_BTN_REGION_BOTTOM = _env_int("SEND_BTN_REGION_BOTTOM", 58)
+SEND_BTN_REGION_W = _env_int("SEND_BTN_REGION_W", 54)
+SEND_BTN_REGION_H = _env_int("SEND_BTN_REGION_H", 36)
+SEND_BTN_BLUE_DELTA = _env_int("SEND_BTN_BLUE_DELTA", 40)
+SEND_BTN_WHITE_BRIGHT = _env_int("SEND_BTN_WHITE_BRIGHT", 200)
 FRONTMOST_WAIT_SECONDS = _env_float("FRONTMOST_WAIT_SECONDS", 3.0)
 FOCUS_RETRY_COUNT = _env_int("FOCUS_RETRY_COUNT", 3)
 
@@ -83,6 +93,12 @@ class _Telemetry:
         self.last_paste_strategy = None  # 'direct' | 'clear_then_paste'
         self.last_copy_method = None     # 'short' | 'full'
         self.last_copy_length = 0
+        self.last_copy_is_echo = False
+        self.response_wait_loops = 0
+        self.response_ready_time = 0.0
+        self.response_stabilized = False
+        self.last_ui_button = None  # 'send' | 'stop' | 'unknown'
+        self.last_ui_avg_color = None  # (r,g,b)
 
     def as_dict(self):
         return {
@@ -95,6 +111,12 @@ class _Telemetry:
             "last_paste_strategy": self.last_paste_strategy,
             "last_copy_method": self.last_copy_method,
             "last_copy_length": self.last_copy_length,
+            "last_copy_is_echo": self.last_copy_is_echo,
+            "response_wait_loops": self.response_wait_loops,
+            "response_ready_time": self.response_ready_time,
+            "response_stabilized": self.response_stabilized,
+            "last_ui_button": self.last_ui_button,
+            "last_ui_avg_color": self.last_ui_avg_color,
         }
 
 
@@ -132,6 +154,159 @@ class MacWindowManager:
         except Exception:
             return False
 
+    def _wait_for_ready_mac(self, message: str, baseline_text: str | None = None) -> tuple[bool, str]:
+        """Активное ожидание ответа на macOS: копируем короткий блок до стабилизации и отсутствия эхо."""
+        start = time.time()
+        last_text = (baseline_text or "").strip()
+        last_change = start
+        got_non_echo = False
+        loops = 0
+        copied_text = ""
+        last_ui_state = None
+        while time.time() - start < max(0.0, RESPONSE_MAX_WAIT_SECONDS):
+            loops += 1
+            try:
+                # Навигация к ответу и копирование
+                pyautogui.press('esc')
+                time.sleep(0.1)
+                pyautogui.keyDown('shift')
+                pyautogui.press('tab')
+                time.sleep(0.1)
+                pyautogui.press('tab')
+                pyautogui.keyUp('shift')
+                time.sleep(0.2)
+                pyautogui.press('enter')
+                time.sleep(0.3)
+                pyautogui.hotkey('command', 'c')
+                time.sleep(0.2)
+                txt = pyperclip.paste() or ""
+                txt = txt.strip()
+            except Exception:
+                txt = ""
+
+            if txt:
+                if self._looks_like_echo(str(message), txt):
+                    self.telemetry.last_copy_is_echo = True
+                    got_non_echo = False
+                else:
+                    self.telemetry.last_copy_is_echo = False
+                    if txt != last_text:
+                        last_text = txt
+                        last_change = time.time()
+                        got_non_echo = True
+                    else:
+                        should_break = got_non_echo and (time.time() - last_change) >= RESPONSE_STABLE_MIN_SECONDS
+                        # Если включена детекция кнопки — требуем состояние 'send'
+                        if USE_UI_BUTTON_DETECTION:
+                            ui_state, avg = self._classify_send_button_mac()
+                            last_ui_state = ui_state
+                            self.telemetry.last_ui_button = ui_state
+                            self.telemetry.last_ui_avg_color = avg
+                            if ui_state != 'send':
+                                should_break = False
+                        if should_break:
+                            copied_text = txt
+                            break
+            time.sleep(RESPONSE_POLL_INTERVAL_SECONDS)
+
+        ready = bool(copied_text)
+        self.telemetry.response_wait_loops = loops
+        self.telemetry.response_ready_time = round(time.time() - start, 2)
+        self.telemetry.response_stabilized = ready
+        return ready, copied_text
+
+    def _classify_send_button_mac(self) -> tuple[str, tuple[int, int, int] | None]:
+        """Классифицирует состояние кнопки (send/stop/unknown) по цвету области в правом нижнем углу окна."""
+        try:
+            if not self._mac_manager:
+                return 'unknown', None
+            bounds = self._mac_manager.get_front_window_bounds()
+            if not bounds:
+                return 'unknown', None
+            x, y, w, h = bounds
+            rx = max(0, x + w - SEND_BTN_REGION_RIGHT)
+            ry = max(0, y + h - SEND_BTN_REGION_BOTTOM)
+            rw = max(1, SEND_BTN_REGION_W)
+            rh = max(1, SEND_BTN_REGION_H)
+            img = pyautogui.screenshot(region=(rx, ry, rw, rh))
+            # Уменьшаем и усредняем
+            small = img.resize((8, 6))
+            pixels = list(small.getdata())
+            r = sum(p[0] for p in pixels) / len(pixels)
+            g = sum(p[1] for p in pixels) / len(pixels)
+            b = sum(p[2] for p in pixels) / len(pixels)
+            r_i, g_i, b_i = int(r), int(g), int(b)
+            blue_delta = b - max(r, g)
+            brightness = (r + g + b) / 3.0
+            if blue_delta >= SEND_BTN_BLUE_DELTA:
+                return 'send', (r_i, g_i, b_i)
+            if brightness >= SEND_BTN_WHITE_BRIGHT:
+                return 'stop', (r_i, g_i, b_i)
+            return 'unknown', (r_i, g_i, b_i)
+        except Exception as e:
+            logger.debug(f"classify_send_button_mac failed: {e}")
+            return 'unknown', None
+
+    def _wait_for_ready_windows(self, message: str, main_window, baseline_text: str | None = None) -> tuple[bool, str]:
+        """Активное ожидание ответа на Windows: копируем короткий блок до стабилизации и отсутствия эхо."""
+        start = time.time()
+        last_text = (baseline_text or "").strip()
+        last_change = start
+        got_non_echo = False
+        loops = 0
+        copied_text = ""
+        while time.time() - start < max(0.0, RESPONSE_MAX_WAIT_SECONDS):
+            loops += 1
+            try:
+                pyautogui.press("esc")
+                time.sleep(0.2)
+                try:
+                    if main_window is not None:
+                        main_window.set_focus()
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                if main_window is not None:
+                    main_window.type_keys("^l", set_foreground=True, pause=0.02)
+                    time.sleep(0.2)
+                pyautogui.keyDown("shift")
+                pyautogui.press("tab")
+                time.sleep(0.15)
+                pyautogui.press("tab")
+                pyautogui.keyUp("shift")
+                time.sleep(0.3)
+                pyautogui.press("enter")
+                time.sleep(0.5)
+                if main_window is not None:
+                    main_window.type_keys("^c", set_foreground=True, pause=0.02)
+                    time.sleep(0.3)
+                txt = pyperclip.paste() or ""
+                txt = txt.strip()
+            except Exception:
+                txt = ""
+
+            if txt:
+                if self._looks_like_echo(str(message), txt):
+                    self.telemetry.last_copy_is_echo = True
+                    got_non_echo = False
+                else:
+                    self.telemetry.last_copy_is_echo = False
+                    if txt != last_text:
+                        last_text = txt
+                        last_change = time.time()
+                        got_non_echo = True
+                    else:
+                        if got_non_echo and (time.time() - last_change) >= RESPONSE_STABLE_MIN_SECONDS:
+                            copied_text = txt
+                            break
+            time.sleep(RESPONSE_POLL_INTERVAL_SECONDS)
+
+        ready = bool(copied_text)
+        self.telemetry.response_wait_loops = loops
+        self.telemetry.response_ready_time = round(time.time() - start, 2)
+        self.telemetry.response_stabilized = ready
+        return ready, copied_text
+
     def focus_by_title_substring(self, substr: str) -> bool:
         titles = self.list_window_titles()
         if not titles:
@@ -146,6 +321,32 @@ class MacWindowManager:
         res = self._osascript(script)
         return res.returncode == 0 and res.stdout.strip().lower() in ("true", "yes")
 
+    def get_front_window_bounds(self) -> tuple[int, int, int, int] | None:
+        """Возвращает (x, y, w, h) активного окна Windsurf. None при ошибке."""
+        try:
+            pos = self._osascript('tell application "System Events" to tell process "Windsurf" to get position of window 1')
+            size = self._osascript('tell application "System Events" to tell process "Windsurf" to get size of window 1')
+            if pos.returncode != 0 or size.returncode != 0:
+                return None
+            # Ответ вида: "{x, y}" и "{w, h}" или "x, y" без скобок
+            def _parse_pair(s: str) -> tuple[int, int] | None:
+                s = (s or "").strip().strip("{}").strip()
+                parts = [p.strip() for p in s.split(",")]
+                if len(parts) != 2:
+                    return None
+                try:
+                    return int(float(parts[0])), int(float(parts[1]))
+                except Exception:
+                    return None
+            xy = _parse_pair(pos.stdout)
+            wh = _parse_pair(size.stdout)
+            if not xy or not wh:
+                return None
+            return xy[0], xy[1], wh[0], wh[1]
+        except Exception as e:
+            logger.debug(f"get_front_window_bounds failed: {e}")
+            return None
+
 
 class DesktopController:
     def __init__(self):
@@ -154,6 +355,83 @@ class DesktopController:
         pyautogui.PAUSE = max(0.1, KEY_DELAY_SECONDS)
         self.telemetry = _Telemetry()
         self._mac_manager = MacWindowManager() if platform.system() == "Darwin" else None
+
+    def _looks_like_echo(self, original: str, copied: str) -> bool:
+        try:
+            o = (original or "").strip()
+            c = (copied or "").strip()
+            if not o or not c:
+                return False
+            prefix = o[: min(24, len(o))]
+            # Эхо, если начинается с префикса исходного текста и по длине почти не длиннее исходника
+            if c.startswith(prefix):
+                if len(c) <= max(len(o) + 32, int(len(o) * 1.2)):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    
+
+    def _wait_for_ready_windows(self, message: str, main_window) -> tuple[bool, str]:
+        """Активное ожидание ответа на Windows: копируем короткий блок до стабилизации и отсутствия эхо."""
+        start = time.time()
+        last_text = ""
+        last_change = start
+        got_non_echo = False
+        loops = 0
+        copied_text = ""
+        while time.time() - start < max(0.0, RESPONSE_MAX_WAIT_SECONDS):
+            loops += 1
+            try:
+                pyautogui.press("esc")
+                time.sleep(0.2)
+                try:
+                    if main_window is not None:
+                        main_window.set_focus()
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                if main_window is not None:
+                    main_window.type_keys("^l", set_foreground=True, pause=0.02)
+                    time.sleep(0.2)
+                pyautogui.keyDown("shift")
+                pyautogui.press("tab")
+                time.sleep(0.15)
+                pyautogui.press("tab")
+                pyautogui.keyUp("shift")
+                time.sleep(0.3)
+                pyautogui.press("enter")
+                time.sleep(0.5)
+                if main_window is not None:
+                    main_window.type_keys("^c", set_foreground=True, pause=0.02)
+                    time.sleep(0.3)
+                txt = pyperclip.paste() or ""
+                txt = txt.strip()
+            except Exception:
+                txt = ""
+
+            if txt:
+                if self._looks_like_echo(str(message), txt):
+                    self.telemetry.last_copy_is_echo = True
+                    got_non_echo = False
+                else:
+                    self.telemetry.last_copy_is_echo = False
+                    if txt != last_text:
+                        last_text = txt
+                        last_change = time.time()
+                        got_non_echo = True
+                    else:
+                        if got_non_echo and (time.time() - last_change) >= RESPONSE_STABLE_MIN_SECONDS:
+                            copied_text = txt
+                            break
+            time.sleep(RESPONSE_POLL_INTERVAL_SECONDS)
+
+        ready = bool(copied_text)
+        self.telemetry.response_wait_loops = loops
+        self.telemetry.response_ready_time = round(time.time() - start, 2)
+        self.telemetry.response_stabilized = ready
+        return ready, copied_text
 
     def copy_to_clipboard(self, text):
         """Надежное копирование текста в буфер обмена"""
@@ -298,37 +576,32 @@ class DesktopController:
                 pyautogui.press('enter')
                 time.sleep(0.5)
 
-                # Ждем ответа ИИ
-                time.sleep(RESPONSE_WAIT_SECONDS)
-
-                # Попытка скопировать ответ: сперва "короткий" целевой блок, затем fallback "полный"
-                copied = False
-                copied_text = ""
+                # Активное ожидание готовности ответа
+                time.sleep(max(0.0, RESPONSE_WAIT_SECONDS))
+                # baseline: текущий короткий блок (обычно это предыдущий ответ)
+                baseline_text = ""
+                try:
+                    pyautogui.press('esc')
+                    time.sleep(0.1)
+                    pyautogui.keyDown('shift')
+                    pyautogui.press('tab')
+                    time.sleep(0.1)
+                    pyautogui.press('tab')
+                    pyautogui.keyUp('shift')
+                    time.sleep(0.2)
+                    pyautogui.press('enter')
+                    time.sleep(0.3)
+                    pyautogui.hotkey('command', 'c')
+                    time.sleep(0.2)
+                    baseline_text = (pyperclip.paste() or "").strip()
+                except Exception as e:
+                    logger.debug(f"baseline copy (macOS) failed: {e}")
                 self.telemetry.last_copy_method = 'short'
-                for attempt in range(COPY_RETRY_COUNT + 1):
-                    try:
-                        pyautogui.press('esc')
-                        time.sleep(0.1)
-                        pyautogui.keyDown('shift')
-                        pyautogui.press('tab')
-                        time.sleep(0.1)
-                        pyautogui.press('tab')
-                        pyautogui.keyUp('shift')
-                        time.sleep(0.2)
-                        pyautogui.press('enter')
-                        time.sleep(0.4)
-                        pyautogui.hotkey('command', 'c')
-                        time.sleep(0.3)
-                        copied_text = pyperclip.paste()
-                        if copied_text and copied_text.strip():
-                            logger.info(f"Скопирован ответ (короткий, macOS): {copied_text[:80]}...")
-                            copied = True
-                            break
-                    except Exception as e:
-                        logger.debug(f"mac copy attempt {attempt} failed: {e}")
-                        time.sleep(0.3)
-                if not copied:
-                    logger.warning("Короткий ответ не получен — пробую скопировать полный текст окна")
+                ready, copied_text = self._wait_for_ready_mac(str(message), baseline_text)
+                copied = ready
+                if not ready:
+                    # Fallback: полный текст окна
+                    logger.warning("Не удалось дождаться стабильного короткого ответа — копирую полный текст (macOS)")
                     try:
                         self.telemetry.last_copy_method = 'full'
                         pyautogui.hotkey('command', 'a')
@@ -336,17 +609,12 @@ class DesktopController:
                         pyautogui.hotkey('command', 'c')
                         time.sleep(0.4)
                         copied_text = pyperclip.paste()
-                        if copied_text and copied_text.strip():
-                            logger.info(f"Скопирован полный текст (macOS): {copied_text[:80]}...")
-                            copied = True
-                        else:
-                            logger.warning("Полное копирование тоже не дало результата")
+                        copied = bool(copied_text and copied_text.strip() and not self._looks_like_echo(str(message), copied_text))
                     except Exception as e:
                         logger.debug(f"full copy fallback failed: {e}")
-
                 self.telemetry.last_copy_length = len(copied_text or "")
                 if not copied:
-                    logger.warning("Не удалось скопировать ответ (macOS), буфер может быть пуст")
+                    logger.warning("Ответ не получен или выглядит как эхо (macOS)")
 
                 self.telemetry.success_sends += 1
                 return True
@@ -442,7 +710,7 @@ class DesktopController:
                 time.sleep(0.5)
 
                 logger.info("Сообщение отправлено, ждем ответ ИИ...")
-                time.sleep(RESPONSE_WAIT_SECONDS)
+                time.sleep(max(0.0, RESPONSE_WAIT_SECONDS))
 
                 # Копирование ответа (Windows)
                 logger.info("Копируем ответ ИИ...")
@@ -467,36 +735,21 @@ class DesktopController:
                 pyautogui.press("enter")
                 time.sleep(0.8)
 
-                copied_text = pyperclip.paste()
-                # Попытка короткого ответа: если похоже на эхо-вопрос — делаем повтор короткого выделения
-                short_copied = False
-                self.telemetry.last_copy_method = 'short'
-                if copied_text.strip().startswith(str(message).strip()[:20]):
-                    try:
-                        if main_window is not None:
-                            main_window.set_focus()
-                    except Exception:
-                        pass
-                    time.sleep(0.2)
-                    if main_window is not None:
-                        main_window.type_keys("^l", set_foreground=True, pause=0.02)
-                        time.sleep(0.3)
-                    pyautogui.keyDown("shift")
-                    pyautogui.press("tab")
-                    time.sleep(0.2)
-                    pyautogui.press("tab")
-                    pyautogui.keyUp("shift")
-                    time.sleep(0.3)
+                # Активное ожидание готовности ответа (Windows)
+                # baseline: текущий короткий блок (обычно это предыдущий ответ)
+                baseline_text = ""
+                try:
                     if main_window is not None:
                         main_window.type_keys("^c", set_foreground=True, pause=0.02)
-                        time.sleep(0.4)
-                    copied_text = pyperclip.paste()
-                if copied_text and copied_text.strip():
-                    short_copied = True
-                    logger.info(f"Ответ скопирован (Windows, короткий): {copied_text[:100]}...")
-                # Fallback: копируем полный текст окна, если короткий не получился
+                        time.sleep(0.3)
+                    baseline_text = (pyperclip.paste() or "").strip()
+                except Exception as e:
+                    logger.debug(f"baseline copy (Windows) failed: {e}")
+                self.telemetry.last_copy_method = 'short'
+                ready, copied_text = self._wait_for_ready_windows(str(message), main_window, baseline_text)
+                short_copied = ready
                 if not short_copied:
-                    logger.warning("Короткий ответ не получен (Windows) — копирую весь текст окна")
+                    logger.warning("Короткий ответ не стабилизировался (Windows) — копирую весь текст окна")
                     self.telemetry.last_copy_method = 'full'
                     try:
                         pyautogui.hotkey('ctrl', 'a')
@@ -508,6 +761,11 @@ class DesktopController:
                         logger.debug(f"full copy fallback (Windows) failed: {e}")
 
                 if copied_text:
+                    if self._looks_like_echo(str(message), copied_text):
+                        self.telemetry.last_copy_is_echo = True
+                        logger.warning("Даже полный текст похож на эхо исходного запроса (Windows)")
+                    else:
+                        self.telemetry.last_copy_is_echo = False
                     self.telemetry.last_copy_length = len(copied_text)
                     logger.info(f"Ответ скопирован в буфер: {copied_text[:100]}...")
                 self.telemetry.success_sends += 1
@@ -528,6 +786,9 @@ class DesktopController:
         d = self.telemetry.as_dict()
         d.update({
             "RESPONSE_WAIT_SECONDS": RESPONSE_WAIT_SECONDS,
+            "RESPONSE_MAX_WAIT_SECONDS": RESPONSE_MAX_WAIT_SECONDS,
+            "RESPONSE_POLL_INTERVAL_SECONDS": RESPONSE_POLL_INTERVAL_SECONDS,
+            "RESPONSE_STABLE_MIN_SECONDS": RESPONSE_STABLE_MIN_SECONDS,
             "PASTE_RETRY_COUNT": PASTE_RETRY_COUNT,
             "COPY_RETRY_COUNT": COPY_RETRY_COUNT,
         })

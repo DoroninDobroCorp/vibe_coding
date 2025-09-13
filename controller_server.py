@@ -31,12 +31,34 @@ async def send(request: web.Request) -> web.Response:
 
     ok = await desktop_controller.send_message_to(target, message) if target else await desktop_controller.send_message(message)
     diag = desktop_controller.get_diagnostics()
+
+    # Помощник для детекции эхо
+    def _looks_like_echo(original: str, copied: str) -> bool:
+        try:
+            o = (original or "").strip()
+            c = (copied or "").strip()
+            if not o or not c:
+                return False
+            prefix = o[: min(24, len(o))]
+            if c.startswith(prefix):
+                if len(c) <= max(len(o) + 32, int(len(o) * 1.2)):
+                    return True
+            return False
+        except Exception:
+            return False
+
     # Пытаемся вернуть текст из буфера обмена (ответ ИИ) — best-effort
     response_text = None
     try:
         clip = pyperclip.paste()
         if isinstance(clip, str) and clip.strip():
-            response_text = clip
+            # Фильтрация эхо, если это копия вопроса
+            if _looks_like_echo(str(message), clip):
+                diag["response_is_echo"] = True
+                response_text = None
+            else:
+                diag["response_is_echo"] = False
+                response_text = clip
     except Exception:
         response_text = None
     return web.json_response({"ok": bool(ok), "diag": diag, "response": response_text})
