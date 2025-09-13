@@ -29,7 +29,11 @@ python bot.py
 
 ### Commands
 /start - Start working with the bot.  
-/status — Diagnostics and runtime parameters.
+/status — Diagnostics and runtime parameters.  
+/model — Manage Gemini model via Telegram:  
+  - `/model current` — show current model  
+  - `/model list [filter]` — list available models (optionally filtered)  
+  - `/model set <name>` — set model, e.g. `gemini-2.5-pro`
 
 ## Platform notes
 
@@ -52,11 +56,26 @@ Essential:
 Optional:
 
 - `GEMINI_API_KEY` — your Gemini API key (if you plan to do AI post-processing yourself).
+- `REMOTE_CONTROLLER_URL` — optional HTTP controller URL (e.g. `http://127.0.0.1:8089`). If set, bot will send messages via remote controller and use its response.
 - `RESPONSE_WAIT_SECONDS` — seconds to wait for AI reply in Windsurf after sending (default 7.0).
 - `PASTE_RETRY_COUNT` — retries for paste operation (default 2).
 - `COPY_RETRY_COUNT` — retries for copy operation (default 2).
 - `KEY_DELAY_SECONDS` — delay between key presses (default 0.2).
 - `USE_APPLESCRIPT_ON_MAC` — whether to activate Windsurf via AppleScript on macOS (1/0, default 1).
+
+## Remote Controller
+
+Run local HTTP controller to interact via REST (useful for remote bots/services):
+
+```bash
+python controller_server.py
+```
+
+Endpoints:
+
+- `GET /health` — health check
+- `GET /windows` — list windows titles (macOS)
+- `POST /send` — send message `{ "message": "...", "target": "index:1" | "substring" }` and receive `{ ok, diag, response }`, where `response` is best-effort clipboard content (AI reply)
 
 ## Diagnostics
 

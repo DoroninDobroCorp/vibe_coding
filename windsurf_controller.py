@@ -53,6 +53,8 @@ COPY_RETRY_COUNT = _env_int("COPY_RETRY_COUNT", 2)
 RESPONSE_WAIT_SECONDS = _env_float("RESPONSE_WAIT_SECONDS", 7.0)
 KEY_DELAY_SECONDS = _env_float("KEY_DELAY_SECONDS", 0.2)
 USE_APPLESCRIPT_ON_MAC = os.getenv("USE_APPLESCRIPT_ON_MAC", "1") not in ("0", "false", "False")
+FRONTMOST_WAIT_SECONDS = _env_float("FRONTMOST_WAIT_SECONDS", 3.0)
+FOCUS_RETRY_COUNT = _env_int("FOCUS_RETRY_COUNT", 3)
 
 
 def _scan_windsurf_processes():
@@ -90,12 +92,62 @@ class _Telemetry:
         }
 
 
+# ========= MacOS Window Manager via AppleScript =========
+class MacWindowManager:
+    """Утилита для работы с окнами Windsurf на macOS через AppleScript/Accessibility.
+    Требует включенный доступ в "Универсальный доступ" для терминала/процесса Python.
+    """
+
+    def _osascript(self, script: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+
+    def list_window_titles(self) -> list[str]:
+        script = (
+            'tell application "System Events" to tell process "Windsurf" to get name of windows'
+        )
+        res = self._osascript(script)
+        if res.returncode != 0:
+            return []
+        # AppleScript может возвращать {"Title1", "Title2"} или строку при одном окне
+        out = res.stdout.strip()
+        if out.startswith("{") and out.endswith("}"):
+            items = [s.strip().strip('"') for s in out[1:-1].split(",")]
+            return items
+        return [out.strip('"')] if out else []
+
+    def focus_by_index(self, index_one_based: int) -> bool:
+        try:
+            script = (
+                'tell application "Windsurf" to activate\n'
+                f'tell application "System Events" to tell process "Windsurf" to perform action "AXRaise" of window {index_one_based}'
+            )
+            res = self._osascript(script)
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    def focus_by_title_substring(self, substr: str) -> bool:
+        titles = self.list_window_titles()
+        if not titles:
+            return False
+        for idx, title in enumerate(titles, start=1):
+            if substr.lower() in (title or "").lower():
+                return self.focus_by_index(idx)
+        return False
+
+    def is_frontmost(self) -> bool:
+        script = 'tell application "System Events" to get frontmost of process "Windsurf"'
+        res = self._osascript(script)
+        return res.returncode == 0 and res.stdout.strip().lower() in ("true", "yes")
+
+
 class DesktopController:
     def __init__(self):
         self.is_ready = False
         pyautogui.FAILSAFE = False
         pyautogui.PAUSE = max(0.1, KEY_DELAY_SECONDS)
         self.telemetry = _Telemetry()
+        self._mac_manager = MacWindowManager() if platform.system() == "Darwin" else None
 
     def copy_to_clipboard(self, text):
         """Надежное копирование текста в буфер обмена"""
@@ -110,16 +162,86 @@ class DesktopController:
                 return True
             else:
                 # Fallback на pyperclip
-                pyperclip.copy(str(text))
-                logger.info("Текст скопирован через pyperclip")
-                return True
+                try:
+                    pyperclip.copy(str(text))
+                    logger.info("Текст скопирован через pyperclip")
+                    return True
+                except Exception as e:
+                    # Доп. fallback для macOS: pbcopy
+                    if platform.system() == "Darwin":
+                        try:
+                            p = subprocess.Popen(["/usr/bin/pbcopy"], stdin=subprocess.PIPE)
+                            p.communicate(input=str(text).encode("utf-8"))
+                            logger.info("Текст скопирован через pbcopy")
+                            return True
+                        except Exception as e2:
+                            logger.error(f"pbcopy failed: {e2}")
+                    raise e
         except Exception as e:
             logger.error(f"Ошибка при копировании в буфер: {e}")
             self.telemetry.last_error = f"copy_to_clipboard: {e}"
             return False
 
+    def _paste_from_clipboard_mac(self, expected_text: str) -> bool:
+        """Вставка и верификация на macOS с ретраями"""
+        pasted_ok = False
+        for attempt in range(PASTE_RETRY_COUNT + 1):
+            try:
+                pyautogui.hotkey('command', 'v')
+                time.sleep(0.5)
+                # Проверяем: CMD+A, CMD+C и сравниваем
+                pyautogui.hotkey('command', 'a')
+                time.sleep(0.1)
+                pyautogui.hotkey('command', 'c')
+                time.sleep(0.2)
+                try:
+                    pasted_text = pyperclip.paste()
+                except Exception:
+                    if platform.system() == "Darwin":
+                        pasted_text = subprocess.check_output(["/usr/bin/pbpaste"]).decode("utf-8", "ignore")
+                    else:
+                        pasted_text = ""
+                if pasted_text.strip() == str(expected_text).strip():
+                    pasted_ok = True
+                    break
+            except Exception as e:
+                logger.debug(f"mac paste attempt {attempt} failed: {e}")
+                time.sleep(0.3)
+        return pasted_ok
 
-    def send_message_sync(self, message):
+    def _ensure_windsurf_frontmost_mac(self, target: str | None) -> bool:
+        """Сфокусировать Windsurf и, при необходимости, конкретное окно.
+        target может быть None/"active" (текущее окно), "index:N" или подстрока заголовка."""
+        if not USE_APPLESCRIPT_ON_MAC:
+            return True
+        try:
+            # Активируем приложение
+            subprocess.run(["osascript", "-e", 'tell application "Windsurf" to activate'], check=False)
+            time.sleep(0.3)
+            # Если задан таргет окна — пытаемся фокусировать его
+            if target and target not in ("active", "default"):
+                if target.startswith("index:"):
+                    idx = int(target.split(":", 1)[1])
+                    ok = self._mac_manager.focus_by_index(idx)
+                    if not ok:
+                        logger.warning(f"Не удалось сфокусировать окно по индексу: {idx}")
+                else:
+                    ok = self._mac_manager.focus_by_title_substring(target)
+                    if not ok:
+                        logger.warning(f"Не удалось сфокусировать окно по заголовку: {target}")
+            # Ждем, пока Windsurf станет frontmost
+            start = time.time()
+            while time.time() - start < FRONTMOST_WAIT_SECONDS:
+                if self._mac_manager.is_frontmost():
+                    return True
+                time.sleep(0.1)
+            logger.warning("Windsurf не стал frontmost за отведенное время")
+            return False
+        except Exception as e:
+            logger.debug(f"ensure frontmost failed: {e}")
+            return False
+
+    def send_message_sync(self, message, target: str | None = None):
         """Синхронная версия отправки сообщения (вызывается в отдельном потоке)"""
 
         system = platform.system()
@@ -127,12 +249,7 @@ class DesktopController:
         try:
             if system == "Darwin":  # macOS путь
                 logger.info("macOS: активируем приложение Windsurf")
-                if USE_APPLESCRIPT_ON_MAC:
-                    try:
-                        subprocess.run(["osascript", "-e", 'tell application "Windsurf" to activate'], check=False)
-                        time.sleep(0.8)
-                    except Exception as e:
-                        logger.warning(f"osascript activate failed: {e}")
+                self._ensure_windsurf_frontmost_mac(target or "active")
 
                 # Копируем в буфер и вставляем CMD+V с ретраями
                 if not self.copy_to_clipboard(str(message)):
@@ -148,23 +265,7 @@ class DesktopController:
                 except Exception as e:
                     logger.debug(f"mac focus (cmd+l) failed: {e}")
 
-                pasted_ok = False
-                for attempt in range(PASTE_RETRY_COUNT + 1):
-                    try:
-                        pyautogui.hotkey('command', 'v')
-                        time.sleep(0.5)
-                        # Проверяем: CMD+A, CMD+C и сравниваем
-                        pyautogui.hotkey('command', 'a')
-                        time.sleep(0.1)
-                        pyautogui.hotkey('command', 'c')
-                        time.sleep(0.2)
-                        pasted_text = pyperclip.paste()
-                        if pasted_text.strip() == str(message).strip():
-                            pasted_ok = True
-                            break
-                    except Exception as e:
-                        logger.debug(f"mac paste attempt {attempt} failed: {e}")
-                        time.sleep(0.3)
+                pasted_ok = self._paste_from_clipboard_mac(str(message))
                 if not pasted_ok:
                     logger.error("Не удалось вставить текст в Windsurf (macOS)")
                     self.telemetry.last_error = "mac paste failed"
@@ -366,6 +467,19 @@ class DesktopController:
     async def send_message(self, message):
         """Асинхронная обертка для отправки сообщения"""
         return await asyncio.to_thread(self.send_message_sync, message)
+
+    async def send_message_to(self, target: str, message):
+        """Асинхронная отправка сообщения в конкретное окно/таргет (macOS: index:N или часть заголовка)."""
+        return await asyncio.to_thread(self.send_message_sync, message, target)
+
+    def list_windows(self) -> list:
+        """Список заголовков окон Windsurf (macOS). На других платформах возвращает пустой список."""
+        try:
+            if platform.system() == "Darwin" and self._mac_manager:
+                return self._mac_manager.list_window_titles()
+        except Exception as e:
+            logger.debug(f"list_windows failed: {e}")
+        return []
 
 
 desktop_controller = DesktopController()
