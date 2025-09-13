@@ -58,7 +58,15 @@ try:
 except Exception:
     GIT_ALLOWED_USER_IDS = set()
 
+# Базовые пути для git: можно задать вручную GIT_WORKDIR; иначе будет автоопределение
+GIT_WORKDIR = (os.getenv("GIT_WORKDIR") or "").strip()
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Переопределения git root
+# По чату (chat_id -> path) — приоритетнее
+CHAT_GIT_ROOT_OVERRIDE: dict[int, str] = {}
+# По пользователю (user_id -> path)
+GIT_ROOT_OVERRIDE: dict[int, str] = {}
 
 # Глобальное хранилище состояний
 user_states = (
@@ -200,12 +208,66 @@ async def cmd_whoami(message: types.Message):
     await message.answer(f"Ваш user_id: {uid}\nusername: @{uname}", reply_markup=main_keyboard)
 
 
-async def _git_run(args: list[str]) -> tuple[int, str, str]:
+async def _get_git_root_for(chat_id: int | None, user_id: int | None) -> str:
+    """Определить корень git-репозитория.
+    Приоритет:
+    1) Переопределение чата: /git setroot <path>
+    2) Переопределение пользователя: /git setroot_user <path>
+    3) GIT_WORKDIR (если каталог существует)
+    4) git rev-parse --show-toplevel (cwd=os.getcwd())
+    5) git rev-parse --show-toplevel (cwd=REPO_ROOT)
+    6) os.getcwd() как fallback
+    """
+    import shutil, os as _os
+    # 1. Переопределение по чату
+    if chat_id is not None:
+        p = CHAT_GIT_ROOT_OVERRIDE.get(chat_id)
+        if p and _os.path.isdir(p):
+            return p
+    # 2. Переопределение по пользователю
+    if user_id is not None:
+        p = GIT_ROOT_OVERRIDE.get(user_id)
+        if p and _os.path.isdir(p):
+            return p
+    # 3. Явно заданный путь через env
+    if GIT_WORKDIR and _os.path.isdir(GIT_WORKDIR):
+        return GIT_WORKDIR
+    # 4. Попытка из текущей рабочей директории
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--show-toplevel",
+            cwd=_os.getcwd(), stdout=_PIPE, stderr=_PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode == 0:
+            p = (out or b"").decode("utf-8", "ignore").strip()
+            if p and _os.path.isdir(p):
+                return p
+    except Exception:
+        pass
+    # 5. Попытка из директории файла бота
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--show-toplevel",
+            cwd=REPO_ROOT, stdout=_PIPE, stderr=_PIPE,
+        )
+        out, err = await proc.communicate()
+        if proc.returncode == 0:
+            p = (out or b"").decode("utf-8", "ignore").strip()
+            if p and _os.path.isdir(p):
+                return p
+    except Exception:
+        pass
+    # 6. Fallback
+    return _os.getcwd()
+
+
+async def _git_run(args: list[str], cwd: str) -> tuple[int, str, str]:
     """Выполнить git-команду и вернуть (code, stdout, stderr)."""
     try:
         proc = await _asyncio.create_subprocess_exec(
             *args,
-            cwd=REPO_ROOT,
+            cwd=cwd,
             stdout=_PIPE,
             stderr=_PIPE,
         )
@@ -226,6 +288,11 @@ async def cmd_git(message: types.Message):
 
     Подкоманды:
     /git -> помощь
+    /git root
+    /git setroot <path>        — задать корень для этого чата
+    /git clearroot             — сбросить корень для этого чата
+    /git setroot_user <path>   — задать корень персонально для вашего user_id
+    /git clearroot_user        — сбросить корень персонально
     /git status
     /git commit <message>
     /git push [remote] [branch]
@@ -243,6 +310,11 @@ async def cmd_git(message: types.Message):
     if len(parts) == 1:
         help_text = (
             "🛠 Команды Git:\n"
+            "• /git root — показать рабочую директорию git\n"
+            "• /git setroot <path> — задать корень для этого чата\n"
+            "• /git clearroot — сбросить корень для этого чата\n"
+            "• /git setroot_user <path> — задать корень персонально для вашего user_id\n"
+            "• /git clearroot_user — сбросить персональный корень\n"
             "• /git status — короткий статус и текущая ветка\n"
             "• /git commit <message> — git add -A && git commit -m <message>\n"
             "• /git push [remote] [branch] — по умолчанию origin и текущая ветка\n"
@@ -252,9 +324,71 @@ async def cmd_git(message: types.Message):
 
     sub = parts[1].lower()
 
+    # /git root
+    if sub == "root":
+        root = await _get_git_root_for(message.chat.id if message.chat else None, message.from_user.id if message.from_user else None)
+        await message.answer(f"Текущий git root: {root}", reply_markup=main_keyboard)
+        return
+
+    # /git setroot <path>
+    if sub == "setroot":
+        if len(parts) < 3:
+            await message.answer("Укажите путь: /git setroot <path>", reply_markup=main_keyboard)
+            return
+        path = " ".join(parts[2:]).strip()
+        import os as _os
+        if not _os.path.isdir(path):
+            await message.answer("❌ Путь не существует или не является директорией", reply_markup=main_keyboard)
+            return
+        # проверяем что это git-репозиторий
+        code, out, err = await _git_run(["git", "rev-parse", "--show-toplevel"], cwd=path)
+        if code != 0:
+            await message.answer("❌ В указанной директории не найден git-репозиторий", reply_markup=main_keyboard)
+            return
+        CHAT_GIT_ROOT_OVERRIDE[message.chat.id] = path
+        await message.answer(f"✅ Корень git для этого чата установлен: {path}", reply_markup=main_keyboard)
+        return
+
+    # /git clearroot
+    if sub == "clearroot":
+        if message.chat and message.chat.id in CHAT_GIT_ROOT_OVERRIDE:
+            CHAT_GIT_ROOT_OVERRIDE.pop(message.chat.id, None)
+            await message.answer("✅ Корень git для этого чата сброшен", reply_markup=main_keyboard)
+        else:
+            await message.answer("Корень git для этого чата не установлен", reply_markup=main_keyboard)
+        return
+
+    # /git setroot_user <path>
+    if sub == "setroot_user":
+        if len(parts) < 3:
+            await message.answer("Укажите путь: /git setroot_user <path>", reply_markup=main_keyboard)
+            return
+        path = " ".join(parts[2:]).strip()
+        import os as _os
+        if not _os.path.isdir(path):
+            await message.answer("❌ Путь не существует или не является директорией", reply_markup=main_keyboard)
+            return
+        code, out, err = await _git_run(["git", "rev-parse", "--show-toplevel"], cwd=path)
+        if code != 0:
+            await message.answer("❌ В указанной директории не найден git-репозиторий", reply_markup=main_keyboard)
+            return
+        GIT_ROOT_OVERRIDE[message.from_user.id] = path
+        await message.answer(f"✅ Персональный git root установлен: {path}", reply_markup=main_keyboard)
+        return
+
+    # /git clearroot_user
+    if sub == "clearroot_user":
+        if message.from_user and message.from_user.id in GIT_ROOT_OVERRIDE:
+            GIT_ROOT_OVERRIDE.pop(message.from_user.id, None)
+            await message.answer("✅ Персональный git root сброшен", reply_markup=main_keyboard)
+        else:
+            await message.answer("Персональный git root не установлен", reply_markup=main_keyboard)
+        return
+
     # /git status
     if sub == "status":
-        code, out, err = await _git_run(["git", "status", "--porcelain=v1", "-b"])
+        root = await _get_git_root_for(message.chat.id if message.chat else None, message.from_user.id if message.from_user else None)
+        code, out, err = await _git_run(["git", "status", "--porcelain=v1", "-b"], cwd=root)
         out = out.strip() or err.strip() or f"exit={code}"
         if len(out) > 3500:
             out = out[:3500] + "\n... (truncated)"
@@ -268,8 +402,9 @@ async def cmd_git(message: types.Message):
             return
         commit_msg = text.split(" ", 2)[2].strip()
         await message.answer("🔄 Выполняю: git add -A; git commit...", reply_markup=main_keyboard)
-        code1, out1, err1 = await _git_run(["git", "add", "-A"])
-        code2, out2, err2 = await _git_run(["git", "commit", "-m", commit_msg])
+        root = await _get_git_root_for(message.chat.id if message.chat else None, message.from_user.id if message.from_user else None)
+        code1, out1, err1 = await _git_run(["git", "add", "-A"], cwd=root)
+        code2, out2, err2 = await _git_run(["git", "commit", "-m", commit_msg], cwd=root)
         summary = (out1 + err1 + "\n" + out2 + err2).strip()
         if len(summary) > 3500:
             summary = summary[:3500] + "\n... (truncated)"
@@ -285,10 +420,12 @@ async def cmd_git(message: types.Message):
         if len(parts) >= 4:
             branch = parts[3]
         else:
-            _, outb, _ = await _git_run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+            root = await _get_git_root_for(message.chat.id if message.chat else None, message.from_user.id if message.from_user else None)
+            _, outb, _ = await _git_run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
             branch = (outb.strip() or "main").splitlines()[0]
         await message.answer(f"🔄 Выполняю: git push {remote} {branch}...", reply_markup=main_keyboard)
-        code, out, err = await _git_run(["git", "push", remote, branch])
+        root = await _get_git_root_for(message.chat.id if message.chat else None, message.from_user.id if message.from_user else None)
+        code, out, err = await _git_run(["git", "push", remote, branch], cwd=root)
         text_out = (out + err).strip()
         if len(text_out) > 3500:
             text_out = text_out[:3500] + "\n... (truncated)"

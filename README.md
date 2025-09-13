@@ -36,6 +36,9 @@ python bot.py
   - `/model set <name>` — set model, e.g. `gemini-2.5-pro`
   
 /git — Manage Git repository (access limited by user_id):  
+  - `/git root` — print detected working directory (git root)  
+  - `/git setroot <path>` — set working directory per-user (must be a git repo)  
+  - `/git clearroot` — clear per-user working directory override  
   - `/git status` — show short status and current branch  
   - `/git commit <message>` — run `git add -A` and `git commit -m <message>`  
   - `/git push [remote] [branch]` — push to remote (default `origin`) and current branch (or specified)  
@@ -65,6 +68,7 @@ Optional:
 - `GEMINI_API_KEY` — your Gemini API key (if you plan to do AI post-processing yourself).
 - `REMOTE_CONTROLLER_URL` — optional HTTP controller URL (e.g. `http://127.0.0.1:8089`). If set, bot will send messages via remote controller and use its response.
 - `GIT_ALLOWED_USER_IDS` — comma-separated Telegram user IDs who can run `/git` commands, e.g. `123456789,987654321`.
+- `GIT_WORKDIR` — optional default working directory for `/git` commands. If not set, the bot will try to detect git root from current process CWD or bot location. You can also override per-user via `/git setroot <path>`.
 - `RESPONSE_WAIT_SECONDS` — seconds to wait for AI reply in Windsurf after sending (default 7.0).
 - `PASTE_RETRY_COUNT` — retries for paste operation (default 2).
 - `COPY_RETRY_COUNT` — retries for copy operation (default 2).
@@ -83,6 +87,11 @@ Examples:
 /git commit Fix: handle remote controller response
 /git push               # defaults: origin <current-branch>
 /git push origin main   # explicit
+
+# Root management
+/git root
+/git setroot /Users/you/Projects/your_repo
+/git clearroot
 ```
 
 ## Remote Controller
