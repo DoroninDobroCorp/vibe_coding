@@ -11,6 +11,9 @@ from typing import Optional, List
 from windsurf_controller import desktop_controller
 from ai_processor import ai_processor
 import aiohttp
+import asyncio as _asyncio
+from asyncio.subprocess import PIPE as _PIPE
+import html
 
 # Используйте для запуска в терминале taskkill /f /im python.exe; Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd 'z:\Dev\vibe\vibe_coding'; python bot.py"
 
@@ -40,13 +43,22 @@ async def remote_send(session: aiohttp.ClientSession, message: str, target: Opti
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
-dp = Dispatcher(bot=bot)
+# Создаем диспетчер без бота; бот будет создан в main()
+dp = Dispatcher()
 
 # URL удаленного контроллера (опционально). Если не задан, управление локальное
 REMOTE_CONTROLLER_URL = (os.getenv("REMOTE_CONTROLLER_URL") or "").strip()
 if REMOTE_CONTROLLER_URL.endswith("/"):
     REMOTE_CONTROLLER_URL = REMOTE_CONTROLLER_URL[:-1]
+
+# Git управление через Telegram: список разрешённых user_id (через запятую)
+_ids_raw = os.getenv("GIT_ALLOWED_USER_IDS", "")
+try:
+    GIT_ALLOWED_USER_IDS = {int(x) for x in _ids_raw.replace(" ", "").split(",") if x.strip().isdigit()}
+except Exception:
+    GIT_ALLOWED_USER_IDS = set()
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Глобальное хранилище состояний
 user_states = (
@@ -77,7 +89,9 @@ async def start_command(message: types.Message):
         "🤖 Бот для работы с Windsurf Desktop\n\n"
         "Команды:\n"
         "/status — статус диагностики и параметров\n"
-        "/model — управление моделью Gemini (list/set/current)\n\n"
+        "/model — управление моделью Gemini (list/set/current)\n"
+        "/git — управление Git (status/commit/push) — доступ ограничен по user_id\n"
+        "/whoami — показать ваш Telegram user_id\n\n"
         "Просто напишите сообщение, чтобы отправить его в Windsurf!",
         reply_markup=main_keyboard,
     )
@@ -179,6 +193,113 @@ async def cmd_model(message: types.Message):
     await message.answer("Неизвестная подкоманда. Используйте /model для помощи.", reply_markup=main_keyboard)
 
 
+@dp.message(Command(commands=["whoami"]))
+async def cmd_whoami(message: types.Message):
+    uid = message.from_user.id if message.from_user else None
+    uname = message.from_user.username if message.from_user else None
+    await message.answer(f"Ваш user_id: {uid}\nusername: @{uname}", reply_markup=main_keyboard)
+
+
+async def _git_run(args: list[str]) -> tuple[int, str, str]:
+    """Выполнить git-команду и вернуть (code, stdout, stderr)."""
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            *args,
+            cwd=REPO_ROOT,
+            stdout=_PIPE,
+            stderr=_PIPE,
+        )
+        out, err = await proc.communicate()
+        return proc.returncode, (out or b"").decode("utf-8", "ignore"), (err or b"").decode("utf-8", "ignore")
+    except Exception as e:
+        return 1, "", f"exec error: {e}"
+
+
+def _git_enabled_for(user_id: int) -> bool:
+    return bool(GIT_ALLOWED_USER_IDS) and (user_id in GIT_ALLOWED_USER_IDS)
+
+
+@dp.message(Command(commands=["git"]))
+async def cmd_git(message: types.Message):
+    """Управление Git через Telegram.
+    Требуется задать env GIT_ALLOWED_USER_IDS=123,456
+
+    Подкоманды:
+    /git -> помощь
+    /git status
+    /git commit <message>
+    /git push [remote] [branch]
+    """
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id or not _git_enabled_for(user_id):
+        await message.answer(
+            "❌ Git-команды отключены. Укажите GIT_ALLOWED_USER_IDS в .env и добавьте свой Telegram user_id.",
+            reply_markup=main_keyboard,
+        )
+        return
+
+    text = (message.text or "").strip()
+    parts = text.split()
+    if len(parts) == 1:
+        help_text = (
+            "🛠 Команды Git:\n"
+            "• /git status — короткий статус и текущая ветка\n"
+            "• /git commit <message> — git add -A && git commit -m <message>\n"
+            "• /git push [remote] [branch] — по умолчанию origin и текущая ветка\n"
+        )
+        await message.answer(help_text, reply_markup=main_keyboard)
+        return
+
+    sub = parts[1].lower()
+
+    # /git status
+    if sub == "status":
+        code, out, err = await _git_run(["git", "status", "--porcelain=v1", "-b"])
+        out = out.strip() or err.strip() or f"exit={code}"
+        if len(out) > 3500:
+            out = out[:3500] + "\n... (truncated)"
+        await message.answer(f"<pre>{html.escape(out)}</pre>", parse_mode="HTML", reply_markup=main_keyboard)
+        return
+
+    # /git commit <message>
+    if sub == "commit":
+        if len(parts) < 3:
+            await message.answer("Укажите сообщение коммита: /git commit <message>", reply_markup=main_keyboard)
+            return
+        commit_msg = text.split(" ", 2)[2].strip()
+        await message.answer("🔄 Выполняю: git add -A; git commit...", reply_markup=main_keyboard)
+        code1, out1, err1 = await _git_run(["git", "add", "-A"])
+        code2, out2, err2 = await _git_run(["git", "commit", "-m", commit_msg])
+        summary = (out1 + err1 + "\n" + out2 + err2).strip()
+        if len(summary) > 3500:
+            summary = summary[:3500] + "\n... (truncated)"
+        status = "✅" if code2 == 0 else "⚠️"
+        content = summary or f"exit={code1},{code2}"
+        await message.answer(f"{status} Результат:\n<pre>{html.escape(content)}</pre>", parse_mode="HTML", reply_markup=main_keyboard)
+        return
+
+    # /git push [remote] [branch]
+    if sub == "push":
+        remote = parts[2] if len(parts) >= 3 else "origin"
+        # определяем текущую ветку, если не указана
+        if len(parts) >= 4:
+            branch = parts[3]
+        else:
+            _, outb, _ = await _git_run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+            branch = (outb.strip() or "main").splitlines()[0]
+        await message.answer(f"🔄 Выполняю: git push {remote} {branch}...", reply_markup=main_keyboard)
+        code, out, err = await _git_run(["git", "push", remote, branch])
+        text_out = (out + err).strip()
+        if len(text_out) > 3500:
+            text_out = text_out[:3500] + "\n... (truncated)"
+        status = "✅" if code == 0 else "❌"
+        content = text_out or f"exit={code}"
+        await message.answer(f"{status} Результат push:\n<pre>{html.escape(content)}</pre>", parse_mode="HTML", reply_markup=main_keyboard)
+        return
+
+    await message.answer("Неизвестная подкоманда. Используйте /git для помощи.", reply_markup=main_keyboard)
+
+
 @dp.message()
 async def handle_message(message: types.Message):
     user_input = message.text.strip()
@@ -267,6 +388,11 @@ async def handle_message(message: types.Message):
 
 async def main():
     logger.info("Starting Windsurf Bot...")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN не задан. Создайте .env и укажите токен.")
+        return
+    bot = Bot(token=token)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

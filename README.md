@@ -34,6 +34,13 @@ python bot.py
   - `/model current` — show current model  
   - `/model list [filter]` — list available models (optionally filtered)  
   - `/model set <name>` — set model, e.g. `gemini-2.5-pro`
+  
+/git — Manage Git repository (access limited by user_id):  
+  - `/git status` — show short status and current branch  
+  - `/git commit <message>` — run `git add -A` and `git commit -m <message>`  
+  - `/git push [remote] [branch]` — push to remote (default `origin`) and current branch (or specified)  
+
+/whoami — Show your Telegram `user_id` to configure access.
 
 ## Platform notes
 
@@ -57,11 +64,26 @@ Optional:
 
 - `GEMINI_API_KEY` — your Gemini API key (if you plan to do AI post-processing yourself).
 - `REMOTE_CONTROLLER_URL` — optional HTTP controller URL (e.g. `http://127.0.0.1:8089`). If set, bot will send messages via remote controller and use its response.
+- `GIT_ALLOWED_USER_IDS` — comma-separated Telegram user IDs who can run `/git` commands, e.g. `123456789,987654321`.
 - `RESPONSE_WAIT_SECONDS` — seconds to wait for AI reply in Windsurf after sending (default 7.0).
 - `PASTE_RETRY_COUNT` — retries for paste operation (default 2).
 - `COPY_RETRY_COUNT` — retries for copy operation (default 2).
 - `KEY_DELAY_SECONDS` — delay between key presses (default 0.2).
 - `USE_APPLESCRIPT_ON_MAC` — whether to activate Windsurf via AppleScript on macOS (1/0, default 1).
+
+## Git via Telegram
+
+You can manage your Git repository directly in Telegram using `/git` commands. For security, only users listed in `GIT_ALLOWED_USER_IDS` can run these commands.
+
+Examples:
+
+```text
+/whoami
+/git status
+/git commit Fix: handle remote controller response
+/git push               # defaults: origin <current-branch>
+/git push origin main   # explicit
+```
 
 ## Remote Controller
 
