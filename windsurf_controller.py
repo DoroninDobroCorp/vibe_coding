@@ -80,6 +80,9 @@ class _Telemetry:
         self.failed_sends = 0
         self.last_error = None
         self.last_platform = platform.system()
+        self.last_paste_strategy = None  # 'direct' | 'clear_then_paste'
+        self.last_copy_method = None     # 'short' | 'full'
+        self.last_copy_length = 0
 
     def as_dict(self):
         return {
@@ -89,6 +92,9 @@ class _Telemetry:
             "platform": self.last_platform,
             "windows_automation": WINDOWS_AUTOMATION_AVAILABLE,
             "windsurf_pids": _scan_windsurf_processes(),
+            "last_paste_strategy": self.last_paste_strategy,
+            "last_copy_method": self.last_copy_method,
+            "last_copy_length": self.last_copy_length,
         }
 
 
@@ -183,13 +189,26 @@ class DesktopController:
             return False
 
     def _paste_from_clipboard_mac(self, expected_text: str) -> bool:
-        """Вставка и верификация на macOS с ретраями"""
+        """Вставка и верификация на macOS с ретраями.
+        На повторных попытках: выделяем всё и удаляем, затем вставляем заново.
+        """
         pasted_ok = False
+        expected = str(expected_text).strip()
         for attempt in range(PASTE_RETRY_COUNT + 1):
             try:
+                if attempt == 0:
+                    self.telemetry.last_paste_strategy = 'direct'
+                else:
+                    self.telemetry.last_paste_strategy = 'clear_then_paste'
+                    logger.warning("Повтор вставки: очищаю поле (Cmd+A, Backspace) и пробую снова")
+                    pyautogui.hotkey('command', 'a')
+                    time.sleep(0.1)
+                    pyautogui.press('backspace')
+                    time.sleep(0.15)
+
                 pyautogui.hotkey('command', 'v')
                 time.sleep(0.5)
-                # Проверяем: CMD+A, CMD+C и сравниваем
+                # Проверяем вставку (Cmd+A, Cmd+C)
                 pyautogui.hotkey('command', 'a')
                 time.sleep(0.1)
                 pyautogui.hotkey('command', 'c')
@@ -201,9 +220,12 @@ class DesktopController:
                         pasted_text = subprocess.check_output(["/usr/bin/pbpaste"]).decode("utf-8", "ignore")
                     else:
                         pasted_text = ""
-                if pasted_text.strip() == str(expected_text).strip():
+                got = (pasted_text or "").strip()
+                if got == expected:
                     pasted_ok = True
                     break
+                else:
+                    logger.debug("Верификация вставки: не совпало (got='%s', expected='%s')", got[:80], expected[:80])
             except Exception as e:
                 logger.debug(f"mac paste attempt {attempt} failed: {e}")
                 time.sleep(0.3)
@@ -279,8 +301,10 @@ class DesktopController:
                 # Ждем ответа ИИ
                 time.sleep(RESPONSE_WAIT_SECONDS)
 
-                # Попытка скопировать последний ответ (лучшее усилие)
+                # Попытка скопировать ответ: сперва "короткий" целевой блок, затем fallback "полный"
                 copied = False
+                copied_text = ""
+                self.telemetry.last_copy_method = 'short'
                 for attempt in range(COPY_RETRY_COUNT + 1):
                     try:
                         pyautogui.press('esc')
@@ -297,12 +321,30 @@ class DesktopController:
                         time.sleep(0.3)
                         copied_text = pyperclip.paste()
                         if copied_text and copied_text.strip():
-                            logger.info(f"Скопирован ответ (macOS): {copied_text[:80]}...")
+                            logger.info(f"Скопирован ответ (короткий, macOS): {copied_text[:80]}...")
                             copied = True
                             break
                     except Exception as e:
                         logger.debug(f"mac copy attempt {attempt} failed: {e}")
                         time.sleep(0.3)
+                if not copied:
+                    logger.warning("Короткий ответ не получен — пробую скопировать полный текст окна")
+                    try:
+                        self.telemetry.last_copy_method = 'full'
+                        pyautogui.hotkey('command', 'a')
+                        time.sleep(0.2)
+                        pyautogui.hotkey('command', 'c')
+                        time.sleep(0.4)
+                        copied_text = pyperclip.paste()
+                        if copied_text and copied_text.strip():
+                            logger.info(f"Скопирован полный текст (macOS): {copied_text[:80]}...")
+                            copied = True
+                        else:
+                            logger.warning("Полное копирование тоже не дало результата")
+                    except Exception as e:
+                        logger.debug(f"full copy fallback failed: {e}")
+
+                self.telemetry.last_copy_length = len(copied_text or "")
                 if not copied:
                     logger.warning("Не удалось скопировать ответ (macOS), буфер может быть пуст")
 
@@ -373,6 +415,13 @@ class DesktopController:
                             if not self.copy_to_clipboard(str(message)):
                                 continue
                             time.sleep(0.2)
+                        # На повторных попытках предварительно очищаем поле
+                        if attempt > 0:
+                            logger.warning("Повтор вставки (Windows): очищаю поле (Ctrl+A, Backspace) перед вставкой")
+                            pyautogui.hotkey('ctrl', 'a')
+                            time.sleep(0.1)
+                            pyautogui.press('backspace')
+                            time.sleep(0.15)
                         # Пытаемся вставить
                         pyautogui.hotkey('ctrl', 'v')
                         time.sleep(0.5)
@@ -384,7 +433,8 @@ class DesktopController:
                         pasted_text = pyperclip.paste()
                         if pasted_text.strip() == str(message).strip():
                             break
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"win paste attempt {attempt} failed: {e}")
                         time.sleep(0.3)
 
                 logger.info("Сообщение напечатано, отправляю Enter")
@@ -418,6 +468,9 @@ class DesktopController:
                 time.sleep(0.8)
 
                 copied_text = pyperclip.paste()
+                # Попытка короткого ответа: если похоже на эхо-вопрос — делаем повтор короткого выделения
+                short_copied = False
+                self.telemetry.last_copy_method = 'short'
                 if copied_text.strip().startswith(str(message).strip()[:20]):
                     try:
                         if main_window is not None:
@@ -438,8 +491,24 @@ class DesktopController:
                         main_window.type_keys("^c", set_foreground=True, pause=0.02)
                         time.sleep(0.4)
                     copied_text = pyperclip.paste()
+                if copied_text and copied_text.strip():
+                    short_copied = True
+                    logger.info(f"Ответ скопирован (Windows, короткий): {copied_text[:100]}...")
+                # Fallback: копируем полный текст окна, если короткий не получился
+                if not short_copied:
+                    logger.warning("Короткий ответ не получен (Windows) — копирую весь текст окна")
+                    self.telemetry.last_copy_method = 'full'
+                    try:
+                        pyautogui.hotkey('ctrl', 'a')
+                        time.sleep(0.2)
+                        pyautogui.hotkey('ctrl', 'c')
+                        time.sleep(0.4)
+                        copied_text = pyperclip.paste()
+                    except Exception as e:
+                        logger.debug(f"full copy fallback (Windows) failed: {e}")
 
                 if copied_text:
+                    self.telemetry.last_copy_length = len(copied_text)
                     logger.info(f"Ответ скопирован в буфер: {copied_text[:100]}...")
                 self.telemetry.success_sends += 1
                 return True

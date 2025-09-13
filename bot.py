@@ -29,16 +29,16 @@ async def remote_list_windows(session: aiohttp.ClientSession) -> List[str]:
         return data.get("windows", [])
 
 
-async def remote_send(session: aiohttp.ClientSession, message: str, target: Optional[str] = None) -> tuple[bool, Optional[str]]:
-    """Отправить сообщение через удалённый контроллер. Возвращает (ok, response_text)."""
+async def remote_send(session: aiohttp.ClientSession, message: str, target: Optional[str] = None) -> tuple[bool, Optional[str], Optional[dict]]:
+    """Отправить сообщение через удалённый контроллер. Возвращает (ok, response_text, diag)."""
     if not REMOTE_CONTROLLER_URL:
-        return False, None
+        return False, None, None
     payload = {"message": message}
     if target:
         payload["target"] = target
     async with session.post(f"{REMOTE_CONTROLLER_URL}/send", json=payload, timeout=20) as resp:
         data = await resp.json()
-        return bool(data.get("ok")), data.get("response")
+        return bool(data.get("ok")), data.get("response"), data.get("diag")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -475,10 +475,11 @@ async def handle_message(message: types.Message):
         # Отправляем сообщение в Windsurf
         await message.answer("🔄 Отправляю запрос в Windsurf...")
         copied_response = None
+        diag = None
         if REMOTE_CONTROLLER_URL:
             try:
                 async with aiohttp.ClientSession() as session:
-                    success, copied_response = await remote_send(session, text, target)
+                    success, copied_response, diag = await remote_send(session, text, target)
             except Exception as e:
                 success = False
                 copied_response = None
@@ -487,6 +488,8 @@ async def handle_message(message: types.Message):
                 success = await desktop_controller.send_message_to(target, text)
             else:
                 success = await desktop_controller.send_message(text)
+            # Получим локальную телеметрию
+            diag = desktop_controller.get_diagnostics()
 
         if not success:
             diag = desktop_controller.get_diagnostics()
@@ -504,10 +507,17 @@ async def handle_message(message: types.Message):
         if copied_response is None:
             import pyperclip
             copied_response = pyperclip.paste()
-        
+        # Сообщение о fallback: если не удалось получить короткий ответ и применили полное копирование
+        prefix_note = ""
+        try:
+            if isinstance(diag, dict) and diag.get("last_copy_method") == "full":
+                prefix_note = "(ℹ️ Короткий ответ недоступен — выслан полный текст окна)\n\n"
+        except Exception:
+            pass
+
         if copied_response and copied_response.strip():
             await message.answer(
-                f"✅ Ответ от Windsurf:\n\n{copied_response}",
+                f"✅ Ответ от Windsurf:\n\n{prefix_note}{copied_response}",
                 reply_markup=main_keyboard,
             )
         else:
