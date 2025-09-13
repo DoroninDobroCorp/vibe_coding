@@ -1,40 +1,101 @@
 import asyncio
 import os
 
-import logger as logger
 import pyautogui
 import time
 import logging
+import platform
+import subprocess
 
 import pyperclip
-from PIL import ImageGrab
 from dotenv import load_dotenv
-from pywinauto import Application
-from pywinauto.keyboard import send_keys
+try:
+    # Импорты специфичные для Windows
+    from pywinauto import Application
+    from pywinauto.keyboard import send_keys
+    WINDOWS_AUTOMATION_AVAILABLE = platform.system() == "Windows"
+except Exception:
+    Application = None
+    send_keys = None
+    WINDOWS_AUTOMATION_AVAILABLE = False
 
 # Добавляем альтернативный способ работы с буфером обмена
 try:
-    import win32clipboard
-    import win32con
-    WIN32CLIPBOARD_AVAILABLE = True
+    if platform.system() == "Windows":
+        import win32clipboard
+        import win32con
+        WIN32CLIPBOARD_AVAILABLE = True
+    else:
+        WIN32CLIPBOARD_AVAILABLE = False
 except ImportError:
     WIN32CLIPBOARD_AVAILABLE = False
-    logger.warning("win32clipboard недоступен, используем pyperclip")
-
-from config import config
-from ocr import ocr_processor
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 WINDSURF_WINDOW_TITLE = os.getenv("WINDSURF_WINDOW_TITLE")
 
+# Параметры через ENV (с дефолтами)
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except Exception:
+        return default
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except Exception:
+        return default
+
+PASTE_RETRY_COUNT = _env_int("PASTE_RETRY_COUNT", 2)
+COPY_RETRY_COUNT = _env_int("COPY_RETRY_COUNT", 2)
+RESPONSE_WAIT_SECONDS = _env_float("RESPONSE_WAIT_SECONDS", 7.0)
+KEY_DELAY_SECONDS = _env_float("KEY_DELAY_SECONDS", 0.2)
+USE_APPLESCRIPT_ON_MAC = os.getenv("USE_APPLESCRIPT_ON_MAC", "1") not in ("0", "false", "False")
+
+
+def _scan_windsurf_processes():
+    try:
+        import psutil
+        pids = []
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                name = (proc.info.get('name') or '').lower()
+                if 'windsurf' in name:
+                    pids.append(proc.info['pid'])
+            except Exception:
+                continue
+        return pids
+    except Exception as e:
+        logger.debug(f"psutil scan error: {e}")
+        return []
+
+
+class _Telemetry:
+    def __init__(self):
+        self.success_sends = 0
+        self.failed_sends = 0
+        self.last_error = None
+        self.last_platform = platform.system()
+
+    def as_dict(self):
+        return {
+            "success_sends": self.success_sends,
+            "failed_sends": self.failed_sends,
+            "last_error": self.last_error,
+            "platform": self.last_platform,
+            "windows_automation": WINDOWS_AUTOMATION_AVAILABLE,
+            "windsurf_pids": _scan_windsurf_processes(),
+        }
+
 
 class DesktopController:
     def __init__(self):
         self.is_ready = False
         pyautogui.FAILSAFE = False
-        pyautogui.PAUSE = 0.3
+        pyautogui.PAUSE = max(0.1, KEY_DELAY_SECONDS)
+        self.telemetry = _Telemetry()
 
     def copy_to_clipboard(self, text):
         """Надежное копирование текста в буфер обмена"""
@@ -54,231 +115,188 @@ class DesktopController:
                 return True
         except Exception as e:
             logger.error(f"Ошибка при копировании в буфер: {e}")
+            self.telemetry.last_error = f"copy_to_clipboard: {e}"
             return False
 
-    # def calibrate(self, area_type):
-    #     """Режим калибровки - пользователь кликает в нужные области"""
-    #     logger.info(f"Калибровка {area_type}. Кликните в нужную область...")
-    #     time.sleep(3)
-    #     x, y = pyautogui.position()
-    #
-    #     if area_type == "input_box":
-    #         config.calibration_data["input_box"] = {"x": x, "y": y}
-    #     elif area_type == "send_button":
-    #         config.calibration_data["send_button"] = {"x": x, "y": y}
-    #     elif area_type == "confirm_button":
-    #         config.calibration_data["confirm_button"] = {"x": x, "y": y}
-    #     elif area_type == "response_area":
-    #         width, height = 600, 400
-    #         config.calibration_data["response_area"] = {
-    #             "x": x,
-    #             "y": y,
-    #             "width": width,
-    #             "height": height,
-    #         }
-    #
-    #     config.save_calibration()
-    #     return True
-
-    # def is_calibrated(self):
-    #     return all(
-    #         [
-    #             # config.calibration_data["input_box"],  # Не нужно - используем Ctrl+L
-    #             # config.calibration_data["send_button"],  # Не нужно - используем Enter
-    #             config.calibration_data["response_area"],
-    #         ]
-    #     )
-    #
-    # def click_confirm_button(self):
-    #     """Клик подтверждающей кнопки если она есть"""
-    #     if config.calibration_data.get("confirm_button"):
-    #         confirm = config.calibration_data["confirm_button"]
-    #         pyautogui.click(confirm["x"], confirm["y"])
-    #         time.sleep(1)
-    #         return True
-    #     return False
 
     def send_message_sync(self, message):
         """Синхронная версия отправки сообщения (вызывается в отдельном потоке)"""
 
+        system = platform.system()
+        self.telemetry.last_platform = system
         try:
-            # Ищем окно Windsurf по имени процесса
-            logger.info("Ищем окно Windsurf...")
-            import psutil
-            windsurf_pids = []
+            if system == "Darwin":  # macOS путь
+                logger.info("macOS: активируем приложение Windsurf")
+                if USE_APPLESCRIPT_ON_MAC:
+                    try:
+                        subprocess.run(["osascript", "-e", 'tell application "Windsurf" to activate'], check=False)
+                        time.sleep(0.8)
+                    except Exception as e:
+                        logger.warning(f"osascript activate failed: {e}")
 
-            for proc in psutil.process_iter(['pid', 'name']):
-                if 'windsurf' in proc.info['name'].lower():
-                    windsurf_pids.append(proc.info['pid'])
+                # Копируем в буфер и вставляем CMD+V с ретраями
+                if not self.copy_to_clipboard(str(message)):
+                    self.telemetry.failed_sends += 1
+                    return False
 
-            logger.info(f"Найдено процессов Windsurf: {len(windsurf_pids)} - PIDs: {windsurf_pids}")
-
-            main_window = None
-            for pid in windsurf_pids:
+                # Попытка сфокусировать поле ввода как в Windows-потоке (Cmd+L)
                 try:
-                    logger.info(f"Проверяем процесс PID: {pid}")
-                    app = Application(backend="uia").connect(process=pid)
-
-                    all_windows = app.windows()
-                    visible_windows = [w for w in all_windows if w.is_visible()]
-
-                    logger.info(f"PID {pid}: всего окон={len(all_windows)}, видимых={len(visible_windows)}")
-
-                    if visible_windows:
-                        main_window = visible_windows[0]
-                        main_window.set_focus()
-                        logger.info(f"Активировано окно из PID {pid}: {main_window.window_text()}")
-                        break
-                    elif all_windows:
-                        main_window = all_windows[0]
-                        main_window.set_focus()
-                        logger.info(f"Активировано скрытое окно из PID {pid}: {main_window.window_text()}")
-                        break
+                    pyautogui.press('esc')
+                    time.sleep(0.1)
+                    pyautogui.hotkey('command', 'l')
+                    time.sleep(0.3)
                 except Exception as e:
-                    logger.info(f"PID {pid} недоступен: {e}")
-                    continue
+                    logger.debug(f"mac focus (cmd+l) failed: {e}")
 
-            if not main_window:
-                raise Exception("Ни в одном процессе Windsurf не найдены окна")
-            time.sleep(3)
-
-            # Поле ввода уже активно, просто печатаем
-            logger.info(f"Печатаем сообщение напрямую: {message}")
-            
-            # Копируем строку в буфер
-            if not self.copy_to_clipboard(str(message)):
-                logger.error("Не удалось скопировать текст в буфер обмена")
-                return False
-            time.sleep(0.2)
-            
-            # Устанавливаем фокус на окно
-            if main_window is not None:
-                try:
-                    main_window.set_focus()
-                    time.sleep(0.5)  # Увеличиваем задержку для стабильности
-                except Exception as e:
-                    logger.warning(f"Не удалось установить фокус через main_window: {e}")
-            
-            # Дополнительная задержка для полной активации окна
-            time.sleep(0.5)
-            
-            # Проверяем содержимое буфера обмена перед вставкой
-            try:
-                clipboard_content = pyperclip.paste()
-                logger.info(f"Содержимое буфера обмена перед вставкой: '{clipboard_content[:50]}...'")
-                if clipboard_content.strip() != str(message).strip():
-                    logger.warning("⚠️ Содержимое буфера не соответствует сообщению, копируем заново")
-                    if not self.copy_to_clipboard(str(message)):
-                        logger.error("Не удалось перекопировать текст")
-                        return False
-                    time.sleep(0.2)
-            except Exception as e:
-                logger.warning(f"Не удалось проверить буфер обмена: {e}")
-            
-            # Пробуем несколько способов вставки для надежности
-            logger.info("Пробуем вставить текст...")
-            
-            # Способ 1: Через pyautogui.hotkey (более надежно)
-            try:
-                pyautogui.hotkey('ctrl', 'v')
-                logger.info("Вставка через pyautogui.hotkey успешна")
-            except Exception as e:
-                logger.warning(f"pyautogui.hotkey не сработал: {e}")
-                
-                # Способ 2: Через main_window.type_keys
-                try:
-                    if main_window is not None:
-                        main_window.type_keys("^V", set_foreground=True, pause=0.1)
-                        logger.info("Вставка через main_window.type_keys успешна")
-                except Exception as e2:
-                    logger.warning(f"main_window.type_keys не сработал: {e2}")
-                    
-                    # Способ 3: Резервный - печатаем по символам
-                    logger.info("Пробуем печатать по символам...")
-                    pyautogui.write(str(message), interval=0.01)
-                    logger.info("Печать по символам завершена")
-
-            time.sleep(1)
-            
-            # Проверяем, что текст действительно вставился
-            logger.info("Проверяем результат вставки...")
-            try:
-                # Выделяем весь текст в поле ввода
-                pyautogui.hotkey('ctrl', 'a')
-                time.sleep(0.2)
-                # Копируем выделенный текст
-                pyautogui.hotkey('ctrl', 'c')
-                time.sleep(0.2)
-                # Проверяем что скопировалось
-                pasted_text = pyperclip.paste()
-                if pasted_text.strip() == str(message).strip():
-                    logger.info("✅ Текст успешно вставлен и проверен")
-                else:
-                    logger.warning(f"⚠️ Текст вставился некорректно. Ожидалось: '{message}', получено: '{pasted_text}'")
-                    # Если текст не вставился, пробуем еще раз
-                    if not pasted_text.strip():
-                        logger.info("Поле пустое, пробую повторную вставку...")
-                        # Очищаем буфер и копируем заново
-                        if not self.copy_to_clipboard(str(message)):
-                            logger.error("Не удалось скопировать текст для повторной вставки")
-                            return False
+                pasted_ok = False
+                for attempt in range(PASTE_RETRY_COUNT + 1):
+                    try:
+                        pyautogui.hotkey('command', 'v')
+                        time.sleep(0.5)
+                        # Проверяем: CMD+A, CMD+C и сравниваем
+                        pyautogui.hotkey('command', 'a')
+                        time.sleep(0.1)
+                        pyautogui.hotkey('command', 'c')
                         time.sleep(0.2)
+                        pasted_text = pyperclip.paste()
+                        if pasted_text.strip() == str(message).strip():
+                            pasted_ok = True
+                            break
+                    except Exception as e:
+                        logger.debug(f"mac paste attempt {attempt} failed: {e}")
+                        time.sleep(0.3)
+                if not pasted_ok:
+                    logger.error("Не удалось вставить текст в Windsurf (macOS)")
+                    self.telemetry.last_error = "mac paste failed"
+                    self.telemetry.failed_sends += 1
+                    return False
+
+                logger.info("Вставка успешна, отправляю Enter")
+                pyautogui.press('enter')
+                time.sleep(0.5)
+
+                # Ждем ответа ИИ
+                time.sleep(RESPONSE_WAIT_SECONDS)
+
+                # Попытка скопировать последний ответ (лучшее усилие)
+                copied = False
+                for attempt in range(COPY_RETRY_COUNT + 1):
+                    try:
+                        pyautogui.press('esc')
+                        time.sleep(0.1)
+                        pyautogui.keyDown('shift')
+                        pyautogui.press('tab')
+                        time.sleep(0.1)
+                        pyautogui.press('tab')
+                        pyautogui.keyUp('shift')
+                        time.sleep(0.2)
+                        pyautogui.press('enter')
+                        time.sleep(0.4)
+                        pyautogui.hotkey('command', 'c')
+                        time.sleep(0.3)
+                        copied_text = pyperclip.paste()
+                        if copied_text and copied_text.strip():
+                            logger.info(f"Скопирован ответ (macOS): {copied_text[:80]}...")
+                            copied = True
+                            break
+                    except Exception as e:
+                        logger.debug(f"mac copy attempt {attempt} failed: {e}")
+                        time.sleep(0.3)
+                if not copied:
+                    logger.warning("Не удалось скопировать ответ (macOS), буфер может быть пуст")
+
+                self.telemetry.success_sends += 1
+                return True
+
+            elif WINDOWS_AUTOMATION_AVAILABLE:
+                # Ищем окно Windsurf по имени процесса (Windows)
+                logger.info("Ищем окно Windsurf (Windows)...")
+                windsurf_pids = _scan_windsurf_processes()
+                logger.info(f"Найдено процессов Windsurf: {len(windsurf_pids)} - PIDs: {windsurf_pids}")
+
+                main_window = None
+                for pid in windsurf_pids:
+                    try:
+                        logger.info(f"Проверяем процесс PID: {pid}")
+                        app = Application(backend="uia").connect(process=pid)
+
+                        all_windows = app.windows()
+                        visible_windows = [w for w in all_windows if w.is_visible()]
+
+                        logger.info(f"PID {pid}: всего окон={len(all_windows)}, видимых={len(visible_windows)}")
+
+                        if visible_windows:
+                            main_window = visible_windows[0]
+                            main_window.set_focus()
+                            logger.info(f"Активировано окно из PID {pid}: {main_window.window_text()}")
+                            break
+                        elif all_windows:
+                            main_window = all_windows[0]
+                            main_window.set_focus()
+                            logger.info(f"Активировано скрытое окно из PID {pid}: {main_window.window_text()}")
+                            break
+                    except Exception as e:
+                        logger.info(f"PID {pid} недоступен: {e}")
+                        continue
+
+                if not main_window:
+                    raise Exception("Ни в одном процессе Windsurf не найдены окна")
+                time.sleep(0.8)
+
+                # Поле ввода уже активно, просто печатаем
+                logger.info(f"Печатаем сообщение напрямую: {message}")
+
+                # Копируем строку в буфер
+                if not self.copy_to_clipboard(str(message)):
+                    logger.error("Не удалось скопировать текст в буфер обмена")
+                    self.telemetry.failed_sends += 1
+                    return False
+                time.sleep(0.2)
+
+                # Устанавливаем фокус на окно
+                if main_window is not None:
+                    try:
+                        main_window.set_focus()
+                        time.sleep(0.3)
+                    except Exception as e:
+                        logger.warning(f"Не удалось установить фокус через main_window: {e}")
+
+                # Дополнительная задержка для полной активации окна
+                time.sleep(0.3)
+
+                # Проверяем содержимое буфера обмена перед вставкой, ретраи
+                for attempt in range(PASTE_RETRY_COUNT + 1):
+                    try:
+                        clipboard_content = pyperclip.paste()
+                        if clipboard_content.strip() != str(message).strip():
+                            if not self.copy_to_clipboard(str(message)):
+                                continue
+                            time.sleep(0.2)
+                        # Пытаемся вставить
                         pyautogui.hotkey('ctrl', 'v')
                         time.sleep(0.5)
-                        
-                        # Проверяем еще раз
+                        # Проверяем вставку
                         pyautogui.hotkey('ctrl', 'a')
-                        time.sleep(0.2)
+                        time.sleep(0.1)
                         pyautogui.hotkey('ctrl', 'c')
                         time.sleep(0.2)
                         pasted_text = pyperclip.paste()
                         if pasted_text.strip() == str(message).strip():
-                            logger.info("✅ Повторная вставка успешна")
-                        else:
-                            logger.error(f"❌ Повторная вставка не удалась: '{pasted_text}'")
-            except Exception as e:
-                logger.warning(f"Не удалось проверить результат вставки: {e}")
+                            break
+                    except Exception:
+                        time.sleep(0.3)
 
-            logger.info("Сообщение напечатано, готово к отправке")
+                logger.info("Сообщение напечатано, отправляю Enter")
+                pyautogui.press("enter")
+                time.sleep(0.5)
 
-            # Нажимаем Enter для отправки
-            pyautogui.press("enter")
-            time.sleep(2)
+                logger.info("Сообщение отправлено, ждем ответ ИИ...")
+                time.sleep(RESPONSE_WAIT_SECONDS)
 
-            logger.info("Сообщение отправлено, ждем ответ ИИ...")
-            # Ждем, чтобы ИИ успел ответить
-            time.sleep(7)
-
-            # Копируем ответ: держим Shift и нажимаем Tab дважды, затем Enter
-            logger.info("Копируем ответ ИИ...")
-            # Снимаем активное выделение (если есть) и фокусируемся на чате Cascade
-            pyautogui.press("esc")
-            time.sleep(0.25)
-            # Минимальная последовательность копирования ответа
-            try:
-                if main_window is not None:
-                    main_window.set_focus()
-            except Exception:
-                pass
-            time.sleep(0.2)
-            if main_window is not None:
-                main_window.type_keys("^l", set_foreground=True, pause=0.02)
-                time.sleep(0.3)
-            
-            pyautogui.keyDown("shift")
-            pyautogui.press("tab")
-            time.sleep(0.2)
-            pyautogui.press("tab")
-            pyautogui.keyUp("shift")
-            time.sleep(0.5)
-            pyautogui.press("enter")
-            time.sleep(2)
-
-            # Проверяем что ответ скопирован в буфер
-            copied_text = pyperclip.paste()
-            # Если в буфере наше исходное сообщение, пробуем ещё раз: выделяем и копируем Ctrl+C
-            if copied_text.strip().startswith(str(message).strip()[:20]):
-                logger.info("В буфере исходное сообщение, пробую повторное копирование через Ctrl+C")
+                # Копирование ответа (Windows)
+                logger.info("Копируем ответ ИИ...")
+                pyautogui.press("esc")
+                time.sleep(0.25)
                 try:
                     if main_window is not None:
                         main_window.set_focus()
@@ -288,64 +306,66 @@ class DesktopController:
                 if main_window is not None:
                     main_window.type_keys("^l", set_foreground=True, pause=0.02)
                     time.sleep(0.3)
+
                 pyautogui.keyDown("shift")
                 pyautogui.press("tab")
                 time.sleep(0.2)
                 pyautogui.press("tab")
                 pyautogui.keyUp("shift")
-                time.sleep(0.3)
-                if main_window is not None:
-                    main_window.type_keys("^c", set_foreground=True, pause=0.02)
-                    time.sleep(0.4)
-                copied_text = pyperclip.paste()
+                time.sleep(0.5)
+                pyautogui.press("enter")
+                time.sleep(0.8)
 
-            logger.info(f"Ответ скопирован в буфер: {copied_text[:100]}...")
-            return True
+                copied_text = pyperclip.paste()
+                if copied_text.strip().startswith(str(message).strip()[:20]):
+                    try:
+                        if main_window is not None:
+                            main_window.set_focus()
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    if main_window is not None:
+                        main_window.type_keys("^l", set_foreground=True, pause=0.02)
+                        time.sleep(0.3)
+                    pyautogui.keyDown("shift")
+                    pyautogui.press("tab")
+                    time.sleep(0.2)
+                    pyautogui.press("tab")
+                    pyautogui.keyUp("shift")
+                    time.sleep(0.3)
+                    if main_window is not None:
+                        main_window.type_keys("^c", set_foreground=True, pause=0.02)
+                        time.sleep(0.4)
+                    copied_text = pyperclip.paste()
+
+                if copied_text:
+                    logger.info(f"Ответ скопирован в буфер: {copied_text[:100]}...")
+                self.telemetry.success_sends += 1
+                return True
+
+            else:
+                logger.warning("Автоматизация недоступна на этой платформе")
+                self.telemetry.last_error = "unsupported platform"
+                return False
         except Exception as e:
             logger.error(f"Ошибка: {str(e)}")
+            self.telemetry.last_error = str(e)
+            self.telemetry.failed_sends += 1
             return False
+
+    def get_diagnostics(self):
+        """Диагностика и телеметрия для /status"""
+        d = self.telemetry.as_dict()
+        d.update({
+            "RESPONSE_WAIT_SECONDS": RESPONSE_WAIT_SECONDS,
+            "PASTE_RETRY_COUNT": PASTE_RETRY_COUNT,
+            "COPY_RETRY_COUNT": COPY_RETRY_COUNT,
+        })
+        return d
 
     async def send_message(self, message):
         """Асинхронная обертка для отправки сообщения"""
         return await asyncio.to_thread(self.send_message_sync, message)
-
-    # def get_response_sync(self, wait_time=10, max_attempts=3):
-    #     """Синхронная версия получения ответа"""
-    #     attempt = 0
-    #     last_response = "Не удалось распознать ответ"
-    #     while attempt < max_attempts:
-    #         try:
-    #             app = Application(backend="uia").connect(title=WINDSURF_WINDOW_TITLE)
-    #             app.window(title=WINDSURF_WINDOW_TITLE).set_focus()
-    #             time.sleep(wait_time)
-    #
-    #             area = config.calibration_data["response_area"]
-    #             bbox = (
-    #                 area["x"],
-    #                 area["y"],
-    #                 area["x"] + area["width"],
-    #                 area["y"] + area["height"],
-    #             )
-    #             pyautogui.click(area["x"], area["y"])  # Активируем область ответа
-    #
-    #             screenshot = ImageGrab.grab(bbox=bbox)
-    #             response_text = ocr_processor.extract_text(screenshot)
-    #             if response_text.strip():
-    #                 last_response = response_text
-    #                 break  # Успешно распознан текст
-    #
-    #             attempt += 1
-    #             time.sleep(2)  # Пауза перед повтором
-    #         except Exception as e:
-    #             logger.error(f"Get response error (attempt {attempt + 1}): {e}")
-    #             attempt += 1
-    #             time.sleep(2)
-    #
-    #     return last_response
-
-    async def get_response(self, wait_time=10, max_attempts=3):
-        """Асинхронная обертка для получения ответа"""
-        return await asyncio.to_thread(self.get_response_sync, wait_time, max_attempts)
 
 
 desktop_controller = DesktopController()
