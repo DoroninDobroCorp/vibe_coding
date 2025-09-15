@@ -765,6 +765,13 @@ class DesktopController:
                 if bounds:
                     try:
                         x, y, w, h = bounds
+                        detailed_log = False
+                        try:
+                            detailed_log = (os.getenv("DETAILED_AUTOMATION_LOG", "0").lower() not in ("0", "false", "no"))
+                        except Exception:
+                            detailed_log = False
+                        if detailed_log:
+                            logger.info(f"[Focus] window bounds (x={x}, y={y}, w={w}, h={h})")
                         ix = os.getenv("INPUT_ABS_X")
                         iy = os.getenv("INPUT_ABS_Y")
                         ax = os.getenv("ANSWER_ABS_X")
@@ -785,6 +792,8 @@ class DesktopController:
                                     focus_x, focus_y = ax_i, ay_i
                         except Exception:
                             focus_x = focus_y = None
+                        if detailed_log:
+                            logger.info(f"[Focus] requested coords: INPUT=({ix},{iy}) ANSWER=({ax},{ay}) -> chosen=({focus_x},{focus_y})")
                         # никаких fallback-ов: кликаем только по ANSWER_ABS_X/Y; если не заданы — пропускаем клик
 
                         # Клампим координаты к экрану и (дополнительно) к окну
@@ -796,6 +805,8 @@ class DesktopController:
                             if isinstance(sw, int) and isinstance(sh, int) and sw > 0 and sh > 0:
                                 focus_x = max(0, min(sw - 1, int(focus_x)))
                                 focus_y = max(0, min(sh - 1, int(focus_y)))
+                                if detailed_log:
+                                    logger.info(f"[Focus] screen size=({sw},{sh}) -> clamped focus=({focus_x},{focus_y})")
                             # Внутри окна с небольшими отступами
                             fx = max(x + 6, min(x + w - 6, int(focus_x)))
                             fy = max(y + 6, min(y + h - 6, int(focus_y)))
@@ -807,6 +818,8 @@ class DesktopController:
                                     dy = int(fy) - int(rp_sy)
                                     # Радиус запрета: чуть больше допуска цвета
                                     ban_r = max(6, int(READY_PIXEL_TOL) + 4)
+                                    if detailed_log:
+                                        logger.info(f"[Focus] READY_PIXEL mapped=({rp_sx},{rp_sy}) tol={READY_PIXEL_TOL} ban_r={ban_r} base_click=({fx},{fy}) d2={dx*dx+dy*dy}")
                                     if (dx*dx + dy*dy) <= (ban_r * ban_r):
                                         logger.info(f"Фокус‑клик близко к READY_PIXEL, ищу безопасное смещение: base=({fx},{fy}) rp=({rp_sx},{rp_sy}) r<={ban_r}")
                                         # Попробуем несколько смещений, чтобы уйти от кнопки Stop, но остаться в окне
@@ -819,6 +832,8 @@ class DesktopController:
                                             nfy = max(y + 6, min(y + h - 6, int(fy + dyo)))
                                             ndx = int(nfx) - int(rp_sx)
                                             ndy = int(nfy) - int(rp_sy)
+                                            if detailed_log:
+                                                logger.info(f"[Focus] try offset ({dxo},{dyo}) -> ({nfx},{nfy}) d2={ndx*ndx+ndy*ndy}")
                                             if (ndx*ndx + ndy*ndy) > (ban_r * ban_r):
                                                 logger.info(f"Фокус‑клик (offset) по координатам: ({nfx},{nfy})")
                                                 pyautogui.click(nfx, nfy)
@@ -851,12 +866,16 @@ class DesktopController:
                         pass
 
                 # 2) Копируем в буфер и вставляем CMD+V с ретраями
+                if detailed_log:
+                    logger.info("[Paste] copying message to clipboard")
                 if not cb_copy(str(message)):
                     self.telemetry.failed_sends += 1
                     return False
 
                 # НЕ используем Cmd+L на macOS — это иногда уводит фокус в терминал/панель
 
+                if detailed_log:
+                    logger.info(f"[Paste] starting paste retries: count={PASTE_RETRY_COUNT}")
                 pasted_ok = cb_paste_mac(str(message), PASTE_RETRY_COUNT)
                 if not pasted_ok:
                     logger.error("Не удалось вставить текст в Windsurf (macOS)")

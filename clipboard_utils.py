@@ -55,10 +55,51 @@ def paste_from_clipboard_mac(expected_text: str, paste_retry_count: int = 2) -> 
     """
     import pyautogui
 
+    import os
+    detailed_log = False
+    try:
+        detailed_log = (os.getenv("DETAILED_AUTOMATION_LOG", "0").lower() not in ("0", "false", "no"))
+    except Exception:
+        detailed_log = False
+
     pasted_ok = False
     expected = str(expected_text).strip()
     for attempt in range(paste_retry_count + 1):
         try:
+            # Optional re-focus before each attempt to ensure input field is active
+            try:
+                refocus_enabled = (os.getenv("CLICK_BEFORE_PASTE", "1").lower() not in ("0", "false", "no"))
+            except Exception:
+                refocus_enabled = True
+            if refocus_enabled:
+                try:
+                    ix = os.getenv("INPUT_ABS_X")
+                    iy = os.getenv("INPUT_ABS_Y")
+                    ax = os.getenv("ANSWER_ABS_X")
+                    ay = os.getenv("ANSWER_ABS_Y")
+                    cx = cy = None
+                    if ix is not None and iy is not None:
+                        cx = int(str(ix).strip())
+                        cy = int(str(iy).strip())
+                    if (cx is None or cy is None) and ax is not None and ay is not None:
+                        cx = int(str(ax).strip())
+                        cy = int(str(ay).strip())
+                    if cx is not None and cy is not None and cx >= 0 and cy >= 0:
+                        try:
+                            sw, sh = pyautogui.size()
+                        except Exception:
+                            sw = sh = None
+                        if isinstance(sw, int) and isinstance(sh, int) and sw > 0 and sh > 0:
+                            cx = max(0, min(sw - 1, int(cx)))
+                            cy = max(0, min(sh - 1, int(cy)))
+                        if detailed_log:
+                            logger.info(f"[Paste] attempt {attempt}: refocus click at ({cx},{cy})")
+                        pyautogui.click(cx, cy)
+                        time.sleep(0.2)
+                except Exception as _e:
+                    if detailed_log:
+                        logger.info(f"[Paste] attempt {attempt}: refocus skipped due to error: {_e}")
+
             if attempt > 0:
                 logger.warning("Повтор вставки: очищаю поле (Cmd+A, Backspace) и пробую снова")
                 pyautogui.hotkey('command', 'a')
@@ -69,6 +110,8 @@ def paste_from_clipboard_mac(expected_text: str, paste_retry_count: int = 2) -> 
             pyautogui.hotkey('command', 'v')
             time.sleep(0.5)
             # Проверяем вставку (Cmd+A, Cmd+C)
+            if detailed_log:
+                logger.info(f"[Paste] attempt {attempt}: select-all and copy to verify")
             pyautogui.hotkey('command', 'a')
             time.sleep(0.1)
             pyautogui.hotkey('command', 'c')
@@ -81,6 +124,10 @@ def paste_from_clipboard_mac(expected_text: str, paste_retry_count: int = 2) -> 
                 else:
                     pasted_text = ""
             got = (pasted_text or "").strip()
+            if detailed_log:
+                logger.info(f"[Paste] attempt {attempt}: got_len={len(got)} expected_len={len(expected)} eq={got==expected}")
+                if len(got) > 3 * max(1, len(expected)) and not (got == expected):
+                    logger.info("[Paste] hint: получен очень длинный текст — вероятно, фокус не в поле ввода (выделилась панель ответа)")
             if got == expected:
                 pasted_ok = True
                 break

@@ -48,6 +48,17 @@ def copy_from_right_panel(bounds: Tuple[int, int, int, int]) -> Tuple[str, Tuple
         f"copy_from_right_panel: region=(rx={rx},ry={ry},rw={rw},rh={rh}), anchor=({start_x},{start_y})"
     )
 
+    # Вспомогательный клик перед копированием (если задан в .env)
+    try:
+        copy_click_x = _env_int("COPY_CLICK_X", 0)
+        copy_click_y = _env_int("COPY_CLICK_Y", 0)
+        if copy_click_x > 0 and copy_click_y > 0:
+            logger.info(f"[Copy] Вспомогательный клик перед копированием в ({copy_click_x},{copy_click_y})")
+            pyautogui.click(copy_click_x, copy_click_y)
+            time.sleep(0.3)  # Даем время на реакцию UI
+    except Exception as e:
+        logger.debug(f"[Copy] Вспомогательный клик пропущен: {e}")
+    
     # Протяжка и автоскролл
     pyautogui.moveTo(start_x, start_y)
     pyautogui.mouseDown(start_x, start_y)
@@ -58,7 +69,10 @@ def copy_from_right_panel(bounds: Tuple[int, int, int, int]) -> Tuple[str, Tuple
         time.sleep(0.04)
     pyautogui.mouseUp(rx + 12, ry + 12)
     time.sleep(0.1)
+    
+    # Копирование с логированием
     pyautogui.hotkey('command', 'c')
-    time.sleep(0.2)
+    time.sleep(0.3)  # Увеличена задержка для надежности
     text = (pyperclip.paste() or "").strip()
+    logger.info(f"[Copy] Скопировано {len(text)} символов")
     return text, (rx, ry, rw, rh)
