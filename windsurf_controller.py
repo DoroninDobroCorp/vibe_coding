@@ -828,19 +828,63 @@ class DesktopController:
                 logger.info("macOS: активируем приложение Windsurf")
                 self._ensure_windsurf_frontmost_mac(target or "active")
 
-                # Копируем в буфер и вставляем CMD+V с ретраями
+                # 1) Гарантируем фокус кликом в правую панель (область ответа)
+                try:
+                    bounds = self._mac_manager.get_front_window_bounds() if self._mac_manager else None
+                except Exception:
+                    bounds = None
+                if bounds:
+                    try:
+                        # перечитаем .env динамически и возьмем ANSWER_ABS_X/Y, если заданы
+                        try:
+                            load_dotenv(override=True)
+                        except Exception:
+                            pass
+                        x, y, w, h = bounds
+                        ax = os.getenv("ANSWER_ABS_X")
+                        ay = os.getenv("ANSWER_ABS_Y")
+                        focus_x = None
+                        focus_y = None
+                        try:
+                            if ax is not None and ay is not None:
+                                ax_i = int(str(ax).strip())
+                                ay_i = int(str(ay).strip())
+                                if ax_i >= 0 and ay_i >= 0:
+                                    focus_x, focus_y = ax_i, ay_i
+                        except Exception:
+                            focus_x = focus_y = None
+                        if focus_x is None or focus_y is None:
+                            # fallback: правая треть окна (панель ответа)
+                            right_third_x = x + max(0, int(w * 2 / 3))
+                            rx = max(0, right_third_x + 8)
+                            ry = max(0, y + max(0, VISUAL_REGION_TOP))
+                            rw = max(16, int(w / 3) - 16)
+                            rh = max(24, h - max(0, VISUAL_REGION_TOP) - max(0, VISUAL_REGION_BOTTOM))
+                            focus_x = rx + min(rw - 8, 24)
+                            focus_y = ry + min(rh - 8, 24)
+                        # Клампим координаты к экрану и (дополнительно) к окну
+                        try:
+                            sw, sh = pyautogui.size()
+                        except Exception:
+                            sw = sh = None
+                        if isinstance(sw, int) and isinstance(sh, int) and sw > 0 and sh > 0:
+                            focus_x = max(0, min(sw - 1, int(focus_x)))
+                            focus_y = max(0, min(sh - 1, int(focus_y)))
+                        # Внутри окна с небольшими отступами
+                        fx = max(x + 6, min(x + w - 6, int(focus_x)))
+                        fy = max(y + 6, min(y + h - 6, int(focus_y)))
+                        pyautogui.click(fx, fy)
+                        self.telemetry.last_click_xy = (fx, fy)
+                        time.sleep(0.15)
+                    except Exception:
+                        pass
+
+                # 2) Копируем в буфер и вставляем CMD+V с ретраями
                 if not cb_copy(str(message)):
                     self.telemetry.failed_sends += 1
                     return False
 
-                # Попытка сфокусировать поле ввода как в Windows-потоке (Cmd+L)
-                try:
-                    pyautogui.press('esc')
-                    time.sleep(0.1)
-                    pyautogui.hotkey('command', 'l')
-                    time.sleep(0.3)
-                except Exception as e:
-                    logger.debug(f"mac focus (cmd+l) failed: {e}")
+                # НЕ используем Cmd+L на macOS — это иногда уводит фокус в терминал/панель
 
                 pasted_ok = cb_paste_mac(str(message), PASTE_RETRY_COUNT)
                 if not pasted_ok:

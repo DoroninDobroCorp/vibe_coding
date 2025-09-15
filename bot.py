@@ -522,21 +522,7 @@ async def handle_message(message: types.Message):
             success = await desktop_controller.send_message(text)
         # Получим локальную телеметрию
         diag = desktop_controller.get_diagnostics()
-        # Если включено строгое ожидание по опорному пикселю — отвечаем только когда он совпал
-        try:
-            rp_required = (os.getenv("READY_PIXEL_REQUIRED", "0").lower() not in ("0", "false"))
-        except Exception:
-            rp_required = False
-        if rp_required:
-            by = (diag or {}).get("response_stabilized_by")
-            last_rp = (diag or {}).get("last_ready_pixel") or {}
-            if by != "ready_pixel" or not last_rp.get("match", False):
-                await message.answer(
-                    "⏳ Ждём готовности ответа: контрольная точка ещё не совпала (READY_PIXEL).",
-                    reply_markup=main_keyboard,
-                )
-                return
-
+        # 1) Если отправка неуспешна — сразу сообщаем об ошибке и выходим
         if not success:
             diag = desktop_controller.get_diagnostics()
             reason = diag.get("last_error") or "Неизвестно"
@@ -560,6 +546,21 @@ async def handle_message(message: types.Message):
                 reply_markup=main_keyboard,
             )
             return
+
+        # 2) Строгий режим по опорному пикселю — сообщаем об ожидании только после успешной отправки
+        try:
+            rp_required = (os.getenv("READY_PIXEL_REQUIRED", "0").lower() not in ("0", "false"))
+        except Exception:
+            rp_required = False
+        if rp_required:
+            by = (diag or {}).get("response_stabilized_by")
+            last_rp = (diag or {}).get("last_ready_pixel") or {}
+            if by != "ready_pixel" or not last_rp.get("match", False):
+                await message.answer(
+                    "⏳ Ждём готовности ответа: контрольная точка ещё не совпала (READY_PIXEL).",
+                    reply_markup=main_keyboard,
+                )
+                return
 
         # Получаем скопированный ответ:
         # - в удаленном режиме НЕ используем локальный буфер обмена как fallback, доверяем полю response от контроллера
