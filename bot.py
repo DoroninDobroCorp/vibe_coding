@@ -10,7 +10,6 @@ from typing import Optional, List
 
 from windsurf_controller import desktop_controller
 from ai_processor import ai_processor
-import aiohttp
 import asyncio as _asyncio
 from asyncio.subprocess import PIPE as _PIPE
 import html
@@ -20,36 +19,46 @@ import html
 load_dotenv()
 
 
-async def remote_list_windows(session: aiohttp.ClientSession) -> List[str]:
-    """Получить список окон с удалённого контроллера"""
-    if not REMOTE_CONTROLLER_URL:
-        return []
-    async with session.get(f"{REMOTE_CONTROLLER_URL}/windows", timeout=10) as resp:
-        data = await resp.json()
-        return data.get("windows", [])
+async def answer_chunks(message: types.Message, text: str, parse_mode: Optional[str] = None, reply_markup: Optional[ReplyKeyboardMarkup] = None):
+    """Безопасная отправка длинных сообщений (разбиение по 4096 символов).
+    Ставит клавиатуру только к первому сообщению, чтобы не дублировать её в чате.
+    """
+    if text is None:
+        return
+    max_len = 4096
+    remaining = text
+    first = True
+    while remaining:
+        if len(remaining) <= max_len:
+            chunk = remaining
+            remaining = ""
+        else:
+            # стараемся резать по переводу строки
+            split_at = remaining.rfind("\n", 0, max_len)
+            if split_at == -1:
+                split_at = max_len
+            chunk = remaining[:split_at]
+            remaining = remaining[split_at:]
+        await message.answer(chunk, parse_mode=parse_mode, reply_markup=(reply_markup if first else None))
+        first = False
 
 
-async def remote_send(session: aiohttp.ClientSession, message: str, target: Optional[str] = None) -> tuple[bool, Optional[str], Optional[dict]]:
-    """Отправить сообщение через удалённый контроллер. Возвращает (ok, response_text, diag)."""
-    if not REMOTE_CONTROLLER_URL:
-        return False, None, None
-    payload = {"message": message}
-    if target:
-        payload["target"] = target
-    async with session.post(f"{REMOTE_CONTROLLER_URL}/send", json=payload, timeout=20) as resp:
-        data = await resp.json()
-        return bool(data.get("ok")), data.get("response"), data.get("diag")
 
-logging.basicConfig(level=logging.INFO)
+_lvl = (os.getenv("LOG_LEVEL") or "DEBUG").upper()
+_map = {
+    "CRITICAL": logging.CRITICAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+}
+logging.basicConfig(level=_map.get(_lvl, logging.DEBUG))
 logger = logging.getLogger(__name__)
 
 # Создаем диспетчер без бота; бот будет создан в main()
 dp = Dispatcher()
 
-# URL удаленного контроллера (опционально). Если не задан, управление локальное
-REMOTE_CONTROLLER_URL = (os.getenv("REMOTE_CONTROLLER_URL") or "").strip()
-if REMOTE_CONTROLLER_URL.endswith("/"):
-    REMOTE_CONTROLLER_URL = REMOTE_CONTROLLER_URL[:-1]
+REMOTE_CONTROLLER_URL = ""
 
 # Git управление через Telegram: список разрешённых user_id (через запятую)
 _ids_raw = os.getenv("GIT_ALLOWED_USER_IDS", "")
@@ -124,8 +133,14 @@ async def status(message: types.Message):
         f"response_wait_loops: {diag.get('response_wait_loops')}",
         f"response_ready_time: {diag.get('response_ready_time')}s",
         f"response_stabilized: {diag.get('response_stabilized')}",
+        f"response_stabilized_by: {diag.get('response_stabilized_by')}",
         f"last_ui_button: {diag.get('last_ui_button')}",
         f"last_ui_avg_color: {diag.get('last_ui_avg_color')}",
+        f"last_visual_region: {diag.get('last_visual_region')}",
+        f"last_click_xy: {diag.get('last_click_xy')}",
+        f"last_ready_pixel: {diag.get('last_ready_pixel')}",
+        f"cpu_quiet_seconds: {diag.get('cpu_quiet_seconds')}",
+        f"cpu_last_total_percent: {diag.get('cpu_last_total_percent')}",
         "",
         "Параметры:",
         f"RESPONSE_WAIT_SECONDS={diag.get('RESPONSE_WAIT_SECONDS')}",
@@ -141,25 +156,31 @@ async def status(message: types.Message):
         f"SEND_BTN_REGION_H={os.getenv('SEND_BTN_REGION_H')}",
         f"SEND_BTN_BLUE_DELTA={os.getenv('SEND_BTN_BLUE_DELTA')}",
         f"SEND_BTN_WHITE_BRIGHT={os.getenv('SEND_BTN_WHITE_BRIGHT')}",
+        f"USE_VISUAL_STABILITY={os.getenv('USE_VISUAL_STABILITY')}",
+        f"VISUAL_REGION_TOP={os.getenv('VISUAL_REGION_TOP')}",
+        f"VISUAL_REGION_BOTTOM={os.getenv('VISUAL_REGION_BOTTOM')}",
+        f"VISUAL_SAMPLE_INTERVAL_SECONDS={os.getenv('VISUAL_SAMPLE_INTERVAL_SECONDS')}",
+        f"VISUAL_DIFF_THRESHOLD={os.getenv('VISUAL_DIFF_THRESHOLD')}",
+        f"VISUAL_STABLE_SECONDS={os.getenv('VISUAL_STABLE_SECONDS')}",
+        f"SAVE_VISUAL_DEBUG={os.getenv('SAVE_VISUAL_DEBUG')}",
+        f"SAVE_VISUAL_DIR={os.getenv('SAVE_VISUAL_DIR')}",
+        f"RIGHT_CLICK_X_FRACTION={os.getenv('RIGHT_CLICK_X_FRACTION')}",
+        f"RIGHT_CLICK_Y_OFFSET={os.getenv('RIGHT_CLICK_Y_OFFSET')}",
+        f"USE_COPY_SHORT_FALLBACK={os.getenv('USE_COPY_SHORT_FALLBACK')}",
+        f"USE_READY_PIXEL={os.getenv('USE_READY_PIXEL')}",
+        f"READY_PIXEL_REQUIRED={os.getenv('READY_PIXEL_REQUIRED')}",
+        f"READY_PIXEL=(x={os.getenv('READY_PIXEL_X')}, y={os.getenv('READY_PIXEL_Y')}, rgb=({os.getenv('READY_PIXEL_R')},{os.getenv('READY_PIXEL_G')},{os.getenv('READY_PIXEL_B')}), tol={os.getenv('READY_PIXEL_TOL')})",
+        f"CLICK_ABS=(x={os.getenv('CLICK_ABS_X')}, y={os.getenv('CLICK_ABS_Y')})",
         "",
         "AI:",
         f"Gemini модель: {ai_processor.get_model_name() or '—'}",
-        f"REMOTE_CONTROLLER_URL: {'вкл' if REMOTE_CONTROLLER_URL else '—'}",
     ]
-    await message.answer("\n".join(status_lines), reply_markup=main_keyboard)
+    await answer_chunks(message, "\n".join(status_lines), reply_markup=main_keyboard)
 
 
 @dp.message(Command(commands=["windows"]))
 async def windows(message: types.Message):
-    if REMOTE_CONTROLLER_URL:
-        try:
-            async with aiohttp.ClientSession() as session:
-                titles = await remote_list_windows(session)
-        except Exception as e:
-            await message.answer(f"Ошибка запроса удаленного контроллера: {e}")
-            return
-    else:
-        titles = desktop_controller.list_windows()
+    titles = desktop_controller.list_windows()
     if not titles:
         await message.answer("Окон Windsurf не найдено или платформа не поддерживает перечисление.", reply_markup=main_keyboard)
         return
@@ -495,20 +516,26 @@ async def handle_message(message: types.Message):
         await message.answer("🔄 Отправляю запрос в Windsurf...")
         copied_response = None
         diag = None
-        if REMOTE_CONTROLLER_URL:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    success, copied_response, diag = await remote_send(session, text, target)
-            except Exception as e:
-                success = False
-                copied_response = None
+        if target:
+            success = await desktop_controller.send_message_to(target, text)
         else:
-            if target:
-                success = await desktop_controller.send_message_to(target, text)
-            else:
-                success = await desktop_controller.send_message(text)
-            # Получим локальную телеметрию
-            diag = desktop_controller.get_diagnostics()
+            success = await desktop_controller.send_message(text)
+        # Получим локальную телеметрию
+        diag = desktop_controller.get_diagnostics()
+        # Если включено строгое ожидание по опорному пикселю — отвечаем только когда он совпал
+        try:
+            rp_required = (os.getenv("READY_PIXEL_REQUIRED", "0").lower() not in ("0", "false"))
+        except Exception:
+            rp_required = False
+        if rp_required:
+            by = (diag or {}).get("response_stabilized_by")
+            last_rp = (diag or {}).get("last_ready_pixel") or {}
+            if by != "ready_pixel" or not last_rp.get("match", False):
+                await message.answer(
+                    "⏳ Ждём готовности ответа: контрольная точка ещё не совпала (READY_PIXEL).",
+                    reply_markup=main_keyboard,
+                )
+                return
 
         if not success:
             diag = desktop_controller.get_diagnostics()
@@ -525,8 +552,11 @@ async def handle_message(message: types.Message):
                 f"response_wait_loops: {diag.get('response_wait_loops')}\n"
                 f"response_ready_time: {diag.get('response_ready_time')}s\n"
                 f"response_stabilized: {diag.get('response_stabilized')}\n"
+                f"response_stabilized_by: {diag.get('response_stabilized_by')}\n"
                 f"last_ui_button: {diag.get('last_ui_button')}\n"
-                f"last_ui_avg_color: {diag.get('last_ui_avg_color')}",
+                f"last_ui_avg_color: {diag.get('last_ui_avg_color')}\n"
+                f"last_visual_region: {diag.get('last_visual_region')}\n"
+                f"last_click_xy: {diag.get('last_click_xy')}",
                 reply_markup=main_keyboard,
             )
             return
@@ -534,7 +564,7 @@ async def handle_message(message: types.Message):
         # Получаем скопированный ответ:
         # - в удаленном режиме НЕ используем локальный буфер обмена как fallback, доверяем полю response от контроллера
         # - в локальном режиме берем из буфера
-        if copied_response is None and not REMOTE_CONTROLLER_URL:
+        if copied_response is None:
             import pyperclip
             copied_response = pyperclip.paste()
 
@@ -554,7 +584,8 @@ async def handle_message(message: types.Message):
             pass
 
         if (copied_response and copied_response.strip()) and not response_is_echo:
-            await message.answer(
+            await answer_chunks(
+                message,
                 f"✅ Ответ от Windsurf:\n\n{prefix_note}{copied_response}",
                 reply_markup=main_keyboard,
             )

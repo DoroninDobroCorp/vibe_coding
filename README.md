@@ -1,117 +1,171 @@
-# Windsurf Bot
-
-[//]: # (to run use: taskkill /f /im python.exe; Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd 'z:\Dev\vibe\vibe_coding'; python bot.py")
-
-A bot for interacting with Windsurf Desktop via Telegram.
-
-## Requirements
-
-- Python 3.10+
-- Windsurf Desktop (application installed and window visible)
-
-## Installation
-
-1. *Install dependencies*:
-   ```bash
-   pip install -r requirements.txt
-2. Create a .env file based on .env.sample.
-3. macOS: grant permissions
-   - System Settings > Privacy & Security > Screen Recording (enable for Terminal/IDE)
-   - System Settings > Privacy & Security > Accessibility (enable for Terminal/IDE)
-
-## Usage
-1. Launch Windsurf Desktop.
-2. Run the bot locally:
-```bash
-python bot.py
-```
-3. Send a message to the bot in Telegram — it will be forwarded to Windsurf. The response will be copied from Windsurf and sent back to the bot. Optional: if GEMINI_API_KEY is set, you can post-process messages on your own.
-
-### Commands
-/start - Start working with the bot.  
-/status — Diagnostics and runtime parameters.  
-/model — Manage Gemini model via Telegram:  
-  - `/model current` — show current model  
-  - `/model list [filter]` — list available models (optionally filtered)  
-  - `/model set <name>` — set model, e.g. `gemini-2.5-pro`
-  
-/git — Manage Git repository (access limited by user_id):  
-  - `/git root` — print detected working directory (git root)  
-  - `/git setroot <path>` — set working directory per-user (must be a git repo)  
-  - `/git clearroot` — clear per-user working directory override  
-  - `/git status` — show short status and current branch  
-  - `/git commit <message>` — run `git add -A` and `git commit -m <message>`  
-  - `/git push [remote] [branch]` — push to remote (default `origin`) and current branch (or specified)  
-
-/whoami — Show your Telegram `user_id` to configure access.
-
-## Platform notes
-
-macOS
-
-- The bot activates Windsurf via AppleScript (can be disabled by env flag) and interacts via Accessibility using hotkeys (Command+V, Command+C, etc.).  
-- Ensure both Screen Recording and Accessibility permissions are granted for the app you use to run the bot (Terminal, iTerm, IDE).
-
-Windows
-
-- Uses `pywinauto` for window focus and `pyautogui` for key sequences. Make sure Windsurf window is visible.
-
-## Configuration (.env)
-
-Essential:
-
-- `TELEGRAM_BOT_TOKEN` — Telegram bot token.
-- `WINDSURF_WINDOW_TITLE` — optional title (best effort).
-
-Optional:
-
-- `GEMINI_API_KEY` — your Gemini API key (if you plan to do AI post-processing yourself).
-- `REMOTE_CONTROLLER_URL` — optional HTTP controller URL (e.g. `http://127.0.0.1:8089`). If set, bot will send messages via remote controller and use its response.
-- `GIT_ALLOWED_USER_IDS` — comma-separated Telegram user IDs who can run `/git` commands, e.g. `123456789,987654321`.
-- `GIT_WORKDIR` — optional default working directory for `/git` commands. If not set, the bot will try to detect git root from current process CWD or bot location. You can also override per-user via `/git setroot <path>`.
-- `RESPONSE_WAIT_SECONDS` — seconds to wait for AI reply in Windsurf after sending (default 7.0).
-- `PASTE_RETRY_COUNT` — retries for paste operation (default 2).
-- `COPY_RETRY_COUNT` — retries for copy operation (default 2).
-- `KEY_DELAY_SECONDS` — delay between key presses (default 0.2).
-- `USE_APPLESCRIPT_ON_MAC` — whether to activate Windsurf via AppleScript on macOS (1/0, default 1).
-
-## Git via Telegram
-
-You can manage your Git repository directly in Telegram using `/git` commands. For security, only users listed in `GIT_ALLOWED_USER_IDS` can run these commands.
-
-Examples:
-
-```text
-/whoami
-/git status
-/git commit Fix: handle remote controller response
-/git push               # defaults: origin <current-branch>
-/git push origin main   # explicit
-
-# Root management
-/git root
-/git setroot /Users/you/Projects/your_repo
-/git clearroot
-```
-
-## Remote Controller
-
-Run local HTTP controller to interact via REST (useful for remote bots/services):
-
-```bash
-python controller_server.py
-```
-
-Endpoints:
-
-- `GET /health` — health check
-- `GET /windows` — list windows titles (macOS)
-- `POST /send` — send message `{ "message": "...", "target": "index:1" | "substring" }` and receive `{ ok, diag, response }`, where `response` is best-effort clipboard content (AI reply)
-
-## Diagnostics
-
-Use `/status` to see:
-
-- platform, windows automation availability, Windsurf process list
-- success/failed send counters and last error
-- current runtime parameters (wait time, retry counts)
+ # Windsurf Bot — RU / EN
+ 
+ Этот проект — Telegram‑бот, который отправляет ваши сообщения в приложение `Windsurf Desktop` и возвращает ответ, когда он готов. На macOS «готовность» определяется двумя независимыми способами: по визуальной стабилизации контента и по «пиксельной» кнопке Send/Stop.
+ 
+ This project is a Telegram bot that sends your messages to the `Windsurf Desktop` app and returns the reply when it is ready. On macOS, readiness is detected using two independent methods: visual stability of the content and the pixel‑based Send/Stop button.
+ 
+ ---
+ 
+ ## RU — Возможности
+ - Отправка сообщений в активное окно Windsurf из Telegram.
+ - Адресация по окнам на macOS: `[ #N ] текст` (по индексу из `/windows`) или `[ @часть_заголовка ] текст` (по подстроке заголовка).
+ - Два детектора готовности (macOS):
+   - Визуальная стабилизация (по умолчанию): фиксация «остановки движения» в области ответа по разнице последовательных скриншотов.
+ 
+## EN — Features
+- Send messages to the active Windsurf window from Telegram.
+- macOS window targeting: `[ #N ] text` (by index from `/windows`) or `[ @title_substring ] text` (by substring).
+- Two readiness detectors (macOS):
+  - Visual stability (default): detect “no motion” in the reply area via screenshot difference.
+  - Pixel button: detect Send/Stop by average color of the bottom‑right region.
+- `/status` diagnostics: runtime telemetry incl. `response_stabilized_by = visual | pixel`.
+- Utilities: `/windows`, `/model`, `/git`, `/whoami`.
+ 
+---
+ ---
+ 
+ ## RU — Требования и права
+ - Python 3.10+.
+ - Установленный Windsurf Desktop (видимое окно).
+ - macOS: включите права для приложения, из которого запускаете бота (Terminal/IDE):
+   - System Settings → Privacy & Security → Screen Recording
+   - System Settings → Privacy & Security → Accessibility
+ 
+ ## EN — Requirements & Permissions
+ - Python 3.10+.
+ - Windsurf Desktop installed (window visible).
+ - macOS: grant permissions to your Terminal/IDE:
+   - System Settings → Privacy & Security → Screen Recording
+   - System Settings → Privacy & Security → Accessibility
+ 
+ ---
+ 
+ ## RU — Установка и запуск
+ 1) Установите зависимости:
+ ```bash
+ pip install -r requirements.txt
+ ```
+ 2) Создайте `.env` на основе `.env.sample` и заполните переменные.
+ 3) Запустите приложение Windsurf Desktop.
+ 4) Запустите бота:
+ ```bash
+ python bot.py
+ ```
+ 5) Напишите боту в Telegram — он отправит текст в Windsurf и вернёт ответ.
+ 
+ ## EN — Install & Run
+ 1) Install dependencies:
+ ```bash
+ pip install -r requirements.txt
+ ```
+ 2) Create `.env` from `.env.sample` and fill in variables.
+ 3) Launch Windsurf Desktop.
+ 4) Run the bot:
+ ```bash
+ python bot.py
+ ```
+ 5) Send a message to the bot in Telegram. It forwards to Windsurf and returns the reply.
+ 
+ ---
+ 
+ ## RU — Команды Telegram
+ - `/start` — краткая помощь.
+ - `/status` — диагностика и параметры.
+ - `/windows` — список окон Windsurf (macOS).
+ - `/model` — управление моделью Gemini (list/set/current).
+ - `/git` — git‑команды (root/status/commit/push) — доступ ограничен по user_id.
+ - `/whoami` — показать ваш Telegram user_id.
+ 
+ ## EN — Telegram Commands
+ - `/start` — quick help.
+ - `/status` — diagnostics and runtime parameters.
+ - `/windows` — list Windsurf windows (macOS).
+ - `/model` — manage Gemini model (list/set/current).
+ - `/git` — git commands (root/status/commit/push) — access limited by user_id.
+ - `/whoami` — show your Telegram user_id.
+ 
+ ---
+ 
+ ## RU — Детекторы готовности (macOS)
+ - Визуальная стабилизация (по умолчанию):
+   - берём мини‑скриншоты области контента окна; считаем среднюю разницу с предыдущим кадром;
+   - если разница ниже порога на протяжении N секунд — считаем, что ответ готов;
+   - затем копируем весь текст окна и возвращаем новый «суффикс» относительно baseline.
+ - Пиксельная кнопка:
+   - берём небольшой регион в правом нижнем углу;
+   - по усреднённому цвету определяем `send` (синяя) / `stop` (яркая/белая);
+   - как только видим `send` — считаем готово, копируем полный текст и извлекаем суффикс.
+ 
+ ## EN — Readiness Detectors (macOS)
+ - Visual stability (default):
+   - take small screenshots of the content area; compute mean difference to previous frame;
+   - if difference stays below a threshold for N seconds — reply is ready;
+   - copy the entire text and return the new suffix relative to the baseline.
+ - Pixel button:
+   - sample the bottom‑right region;
+   - detect `send` (blue) / `stop` (bright/white) by average color;
+   - when `send` is seen — copy full text and extract the suffix.
+ 
+ ---
+ 
+ ## RU — Конфигурация (.env)
+ - Обязательные:
+   - `TELEGRAM_BOT_TOKEN` — токен бота.
+ - Опциональные:
+   - `WINDSURF_WINDOW_TITLE` — подстрока заголовка окна (best‑effort).
+   - Тайминги:
+     - `RESPONSE_WAIT_SECONDS` — пауза после отправки перед ожиданием (по умолчанию 7.0)
+     - `RESPONSE_MAX_WAIT_SECONDS` — максимум ожидания ответа (по умолчанию 45)
+     - `RESPONSE_POLL_INTERVAL_SECONDS` — интервал опроса (по умолчанию 0.8)
+     - `RESPONSE_STABLE_MIN_SECONDS` — минимальная «тишина» для стабилизации (по умолчанию 1.6)
+   - Вставка/копирование:
+     - `PASTE_RETRY_COUNT`, `COPY_RETRY_COUNT`, `KEY_DELAY_SECONDS`
+   - Фокус:
+     - `USE_APPLESCRIPT_ON_MAC=1`, `FRONTMOST_WAIT_SECONDS`, `FOCUS_RETRY_COUNT`
+   - Пиксельная кнопка:
+     - `USE_UI_BUTTON_DETECTION=0|1`
+     - `SEND_BTN_REGION_RIGHT`, `SEND_BTN_REGION_BOTTOM`, `SEND_BTN_REGION_W`, `SEND_BTN_REGION_H`
+     - `SEND_BTN_BLUE_DELTA`, `SEND_BTN_WHITE_BRIGHT`
+   - Визуальная стабилизация (по умолчанию включена):
+     - `USE_VISUAL_STABILITY=1`
+     - `VISUAL_REGION_TOP`, `VISUAL_REGION_BOTTOM`
+     - `VISUAL_SAMPLE_INTERVAL_SECONDS`, `VISUAL_DIFF_THRESHOLD`, `VISUAL_STABLE_SECONDS`
+   - Git:
+     - `GIT_ALLOWED_USER_IDS`, `GIT_WORKDIR`
+ 
+ ## EN — Configuration (.env)
+ - Required:
+   - `TELEGRAM_BOT_TOKEN` — bot token.
+ - Optional:
+   - `WINDSURF_WINDOW_TITLE` — window title substring (best‑effort).
+   - Timings:
+     - `RESPONSE_WAIT_SECONDS` (default 7.0)
+     - `RESPONSE_MAX_WAIT_SECONDS` (default 45)
+     - `RESPONSE_POLL_INTERVAL_SECONDS` (default 0.8)
+     - `RESPONSE_STABLE_MIN_SECONDS` (default 1.6)
+   - Paste/copy:
+     - `PASTE_RETRY_COUNT`, `COPY_RETRY_COUNT`, `KEY_DELAY_SECONDS`
+   - Focus:
+     - `USE_APPLESCRIPT_ON_MAC=1`, `FRONTMOST_WAIT_SECONDS`, `FOCUS_RETRY_COUNT`
+   - Pixel button:
+     - `USE_UI_BUTTON_DETECTION=0|1`
+     - `SEND_BTN_REGION_RIGHT`, `SEND_BTN_REGION_BOTTOM`, `SEND_BTN_REGION_W`, `SEND_BTN_REGION_H`
+     - `SEND_BTN_BLUE_DELTA`, `SEND_BTN_WHITE_BRIGHT`
+   - Visual stability (enabled by default):
+     - `USE_VISUAL_STABILITY=1`
+     - `VISUAL_REGION_TOP`, `VISUAL_REGION_BOTTOM`
+     - `VISUAL_SAMPLE_INTERVAL_SECONDS`, `VISUAL_DIFF_THRESHOLD`, `VISUAL_STABLE_SECONDS`
+   - Git:
+     - `GIT_ALLOWED_USER_IDS`, `GIT_WORKDIR`
+ 
+ ---
+ 
+ ## RU — Советы и отладка
+ - Если фиксация срабатывает слишком рано — увеличьте `VISUAL_STABLE_SECONDS` или немного поднимите `VISUAL_DIFF_THRESHOLD`.
+ - Если слишком поздно — уменьшите `VISUAL_STABLE_SECONDS` или снизьте `VISUAL_DIFF_THRESHOLD`.
+ - Команда `/status` показывает `response_stabilized_by` (visual|pixel) и базовую телеметрию.
+ 
+ ## EN — Tips & Troubleshooting
+ - If stabilization triggers too early — increase `VISUAL_STABLE_SECONDS` or slightly raise `VISUAL_DIFF_THRESHOLD`.
+ - If too late — decrease `VISUAL_STABLE_SECONDS` or lower `VISUAL_DIFF_THRESHOLD`.
+ - `/status` shows `response_stabilized_by` (visual|pixel) and basic telemetry.
