@@ -104,6 +104,7 @@ READY_PIXEL_TOL_PCT = _env_float("READY_PIXEL_TOL_PCT", -1.0)  # если >=0, �
 READY_PIXEL_COORD_MODE = os.getenv("READY_PIXEL_COORD_MODE", "top").strip().lower()
 READY_PIXEL_DX = _env_int("READY_PIXEL_DX", 0)
 READY_PIXEL_DY = _env_int("READY_PIXEL_DY", 0)
+READY_PIXEL_PROBE_INTERVAL_SECONDS = _env_float("READY_PIXEL_PROBE_INTERVAL_SECONDS", 7.0)
 CLICK_ABS_X = _env_int("CLICK_ABS_X", -1)
 CLICK_ABS_Y = _env_int("CLICK_ABS_Y", -1)
 
@@ -288,21 +289,13 @@ class DesktopController:
         По готовности копируем весь текст и извлекаем суффикс относительно baseline.
         """
         start = time.time()
-        # Снимем baseline полного текста (до генерации)
+        # READY_PIXEL-only режим: не отправляем никаких хоткеев во время ожидания
         baseline_full = ""
-        if not READY_PIXEL_REQUIRED:
-            try:
-                pyautogui.hotkey('command', 'a')
-                time.sleep(0.15)
-                pyautogui.hotkey('command', 'c')
-                time.sleep(0.2)
-                baseline_full = (pyperclip.paste() or "").strip()
-            except Exception:
-                baseline_full = ""
+        logger.info("macOS: ожидание READY_PIXEL — без отправки каких-либо клавиш/копирования до готовности")
 
         loops = 0
         ready_by = None  # 'visual' | 'pixel'
-        # Визуальная стабилизация
+        # Визуальная стабилизация — отключено (оставляем только READY_PIXEL)
         visual_prev_small = None
         visual_last_change = start
         last_visual_sample = 0.0
@@ -310,8 +303,8 @@ class DesktopController:
         while time.time() - start < max(0.0, RESPONSE_MAX_WAIT_SECONDS):
             loops += 1
 
-            # 1) Визуальная стабилизация (динамически читаем флаг из ENV)
-            _use_vs = os.getenv("USE_VISUAL_STABILITY", "1").lower() not in ("0", "false")
+            # 1) Визуальная стабилизация — отключено намеренно
+            _use_vs = False
             if _use_vs and self._mac_manager:
                 now = time.time()
                 if now - last_visual_sample >= max(0.1, VISUAL_SAMPLE_INTERVAL_SECONDS):
@@ -356,8 +349,8 @@ class DesktopController:
                         except Exception:
                             pass
 
-            # 2) Пиксельная детекция кнопки
-            if ready_by is None and USE_UI_BUTTON_DETECTION:
+            # 2) Пиксельная детекция кнопки — отключено намеренно
+            if False and ready_by is None and USE_UI_BUTTON_DETECTION:
                 ui_state, avg = self._classify_send_button_mac()
                 self.telemetry.last_ui_button = ui_state
                 self.telemetry.last_ui_avg_color = avg
@@ -367,11 +360,6 @@ class DesktopController:
             # 3) Датчик готовности по опорному пикселю (абсолютные координаты)
             if ready_by is None and USE_READY_PIXEL and READY_PIXEL_X >= 0 and READY_PIXEL_Y >= 0:
                 try:
-                    # Поддержка динамического чтения ENV на каждом цикле, чтобы не требовать рестарта
-                    try:
-                        load_dotenv(override=True)
-                    except Exception:
-                        pass
                     rp_x = int(os.getenv("READY_PIXEL_X", str(READY_PIXEL_X)))
                     rp_y = int(os.getenv("READY_PIXEL_Y", str(READY_PIXEL_Y)))
                     rp_r = int(os.getenv("READY_PIXEL_R", str(READY_PIXEL_R)))
@@ -406,7 +394,14 @@ class DesktopController:
                         'tol_pct': rp_tol_pct if rp_tol_pct is not None and rp_tol_pct >= 0 else None,
                         'delta': (dr, dg, db), 'match': match,
                     }
-                    # Сохраняем снимки (умолчание: только при совпадении и только USED; гипотезы — по флагу)
+                    if not match:
+                        logger.info(
+                            "READY_PIXEL проверка: used_xy=(%d,%d) цвет=(%d,%d,%d) не подходит; жду %.1fs",
+                            sx, sy, int(pr), int(pg), int(pb), READY_PIXEL_PROBE_INTERVAL_SECONDS
+                        )
+                        time.sleep(READY_PIXEL_PROBE_INTERVAL_SECONDS)
+                        continue
+                    # Сохраняем снимки (умолчание: только при совпадении и не сохраняем гипотезы)
                     if SAVE_VISUAL_DEBUG:
                         try:
                             if (not SAVE_READY_ONLY_ON_MATCH) or match:
@@ -511,7 +506,7 @@ class DesktopController:
             try:
                 # 0) Если включён строгий режим — выделим текст мышью в правой панели и скопируем
                 short_txt = ''
-                if READY_PIXEL_REQUIRED and self._mac_manager:
+                if False and READY_PIXEL_REQUIRED and self._mac_manager:
                     bounds = None
                     try:
                         bounds = self._mac_manager.get_front_window_bounds()
@@ -575,7 +570,7 @@ class DesktopController:
                     self.telemetry.last_copy_length = len(copied_text)
                     final_full = ''
                 else:
-                    # 1) Если короткое не удалось — кликаем по абсолютной точке (если задана) или в правую треть и копируем весь текст
+                    # 1) Полное копирование: клик по ANSWER_ABS_X/Y, скролл вниз до конца и протяжка c автоскроллом
                     bounds = None
                     try:
                         bounds = self._mac_manager.get_front_window_bounds() if self._mac_manager else None
@@ -583,72 +578,23 @@ class DesktopController:
                         bounds = None
                     if bounds:
                         x, y, w, h = bounds
-                        # Берём АКТУАЛЬНЫЕ значения из ENV на момент клика, чтобы не требовать рестарт бота
+                        # Точка клика — только ANSWER_ABS_X/Y; если не заданы — fallback в правой панели
                         try:
-                            load_dotenv(override=True)
+                            ax = int(os.getenv("ANSWER_ABS_X", "-1"))
+                            ay = int(os.getenv("ANSWER_ABS_Y", "-1"))
                         except Exception:
-                            pass
-                        # 1) Координаты в процентах от окна (если заданы)
-                        used_winpct = False
-                        try:
-                            winpct_raw = os.getenv("CLICK_WINPCT", "").strip()
-                        except Exception:
-                            winpct_raw = ""
-                        wp_x = wp_y = None
-                        if winpct_raw and "," in winpct_raw:
-                            try:
-                                sx, sy = winpct_raw.split(",", 1)
-                                wp_x = float(sx.strip())
-                                wp_y = float(sy.strip())
-                            except Exception:
-                                wp_x = wp_y = None
-                        if wp_x is None or wp_y is None:
-                            try:
-                                wp_x = float(os.getenv("CLICK_WINPCT_X", ""))
-                                wp_y = float(os.getenv("CLICK_WINPCT_Y", ""))
-                            except Exception:
-                                wp_x = wp_x if isinstance(wp_x, float) else None
-                                wp_y = wp_y if isinstance(wp_y, float) else None
-                        if isinstance(wp_x, float) and isinstance(wp_y, float):
-                            # clamp to [0,1]
-                            px = max(0.0, min(1.0, wp_x))
-                            py = max(0.0, min(1.0, wp_y))
-                            click_x = int(x + px * w)
-                            click_y = int(y + py * h)
-                            used_winpct = True
-
-                        # 2) Абсолютные координаты (если заданы и режим winpct не использован)
-                        if not used_winpct:
-                            try:
-                                cx_env = int(os.getenv("CLICK_ABS_X", str(CLICK_ABS_X)))
-                            except Exception:
-                                cx_env = CLICK_ABS_X
-                            try:
-                                cy_env = int(os.getenv("CLICK_ABS_Y", str(CLICK_ABS_Y)))
-                            except Exception:
-                                cy_env = CLICK_ABS_Y
-                            if cx_env >= 0 and cy_env >= 0:
-                                click_x, click_y = cx_env, cy_env
-
-                        # 3) Правый сектор окна (fallback)
-                        if 'click_x' not in locals() or 'click_y' not in locals():
-                            # Динамически подхватываем и параметры прицеливания
-                            try:
-                                rxf = float(os.getenv("RIGHT_CLICK_X_FRACTION", str(RIGHT_CLICK_X_FRACTION)))
-                            except Exception:
-                                rxf = RIGHT_CLICK_X_FRACTION
-                            try:
-                                ryo = int(os.getenv("RIGHT_CLICK_Y_OFFSET", str(RIGHT_CLICK_Y_OFFSET)))
-                            except Exception:
-                                ryo = RIGHT_CLICK_Y_OFFSET
-                            try:
-                                vtop = int(os.getenv("VISUAL_REGION_TOP", str(VISUAL_REGION_TOP)))
-                            except Exception:
-                                vtop = VISUAL_REGION_TOP
-                            right_x0 = x + max(0, int(w * 2 / 3))
-                            click_x = right_x0 + max(12, int((w / 3) * min(max(rxf, 0.05), 0.95)))
-                            click_y = y + max(0, vtop) + max(0, int(ryo))
-                        # Страховка: ограничим точку клика рамками окна и экрана, чтобы не "упираться" в углы
+                            ax = ay = -1
+                        if ax >= 0 and ay >= 0:
+                            click_x, click_y = ax, ay
+                        else:
+                            right_third_x = x + max(0, int(w * 2 / 3))
+                            rx = max(0, right_third_x + 8)
+                            ry = max(0, y + max(0, VISUAL_REGION_TOP))
+                            rw = max(16, int(w / 3) - 16)
+                            rh = max(24, h - max(0, VISUAL_REGION_TOP) - max(0, VISUAL_REGION_BOTTOM))
+                            click_x = rx + max(12, int(rw * 0.9))
+                            click_y = ry + max(12, int(rh * 0.9))
+                        # Страховка: ограничим точку клика рамками окна и экрана
                         try:
                             sw, sh = pyautogui.size()
                         except Exception:
@@ -660,43 +606,25 @@ class DesktopController:
                         click_x = max(x + 6, min(x + w - 6, int(click_x)))
                         click_y = max(y + 6, min(y + h - 6, int(click_y)))
                         try:
-                            # Сохраним скриншот области вокруг точки клика для диагностики (с маркером)
-                            if SAVE_VISUAL_DEBUG:
-                                try:
-                                    ts = int(time.time())
-                                    sw, sh = pyautogui.size()
-                                    cw, ch = 280, 200  # ширина/высота области вокруг клика
-                                    rx = max(0, min(sw - cw, int(click_x - cw / 2)))
-                                    ry = max(0, min(sh - ch, int(click_y - ch / 2)))
-                                    dbg_img = pyautogui.screenshot(region=(rx, ry, cw, ch))
-                                    try:
-                                        from PIL import ImageDraw
-                                        d = ImageDraw.Draw(dbg_img)
-                                        d.line([(cw//2 - 10, ch//2), (cw//2 + 10, ch//2)], fill=(255,0,0), width=2)
-                                        d.line([(cw//2, ch//2 - 10), (cw//2, ch//2 + 10)], fill=(255,0,0), width=2)
-                                    except Exception:
-                                        pass
-                                    os.makedirs(SAVE_VISUAL_DIR, exist_ok=True)
-                                    dbg_img.save(os.path.join(SAVE_VISUAL_DIR, f"visual_click_{ts}_{rx}x{ry}_{cw}x{ch}.png"))
-                                    # Дополнительно: полноэкранный снимок с крестом в реальной точке клика
-                                    try:
-                                        fs = pyautogui.screenshot()
-                                        from PIL import ImageDraw
-                                        d2 = ImageDraw.Draw(fs)
-                                        d2.line([(click_x - 12, click_y), (click_x + 12, click_y)], fill=(0,255,0), width=3)
-                                        d2.line([(click_x, click_y - 12), (click_x, click_y + 12)], fill=(0,255,0), width=3)
-                                        max_w = 1600
-                                        if fs.width > max_w:
-                                            ratio = max_w / fs.width
-                                            fs = fs.resize((max_w, int(fs.height * ratio)))
-                                        fs.save(os.path.join(SAVE_VISUAL_DIR, f"visual_click_USED_FULL_{ts}_{click_x}x{click_y}.png"))
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    pass
-                            pyautogui.click(click_x, click_y)
-                            self.telemetry.last_click_xy = (click_x, click_y)
-                            time.sleep(0.2)
+                            # Защита от клика по зоне READY_PIXEL
+                            do_click = True
+                            if USE_READY_PIXEL and READY_PIXEL_X >= 0 and READY_PIXEL_Y >= 0:
+                                rp_sx, rp_sy = map_ready_pixel_xy(READY_PIXEL_X, READY_PIXEL_Y, READY_PIXEL_COORD_MODE, READY_PIXEL_DX, READY_PIXEL_DY)
+                                dx = int(click_x) - int(rp_sx)
+                                dy = int(click_y) - int(rp_sy)
+                                ban_r = max(6, int(READY_PIXEL_TOL) + 4)
+                                if (dx*dx + dy*dy) <= (ban_r * ban_r):
+                                    logger.info(f"Пропускаю клик перед копированием: ({click_x},{click_y}) близко к READY_PIXEL ({rp_sx},{rp_sy}), r<={ban_r}")
+                                    do_click = False
+                            if do_click:
+                                logger.info(f"Фокус перед копированием: click=({click_x},{click_y})")
+                                pyautogui.click(click_x, click_y)
+                                self.telemetry.last_click_xy = (click_x, click_y)
+                                time.sleep(0.15)
+                                # Прокрутка до самого низа, чтобы начать копирование с конца
+                                for _ in range(12):
+                                    pyautogui.scroll(-1000)
+                                    time.sleep(0.04)
                         except Exception:
                             pass
                     # Сохраним и финальный регион, если включен отладочный режим
@@ -828,54 +756,97 @@ class DesktopController:
                 logger.info("macOS: активируем приложение Windsurf")
                 self._ensure_windsurf_frontmost_mac(target or "active")
 
-                # 1) Гарантируем фокус кликом в правую панель (область ответа)
+                # 1) Гарантируем фокус кликом по полю ввода (если заданы INPUT_ABS_X/Y),
+                #    иначе кликом в область ответа (ANSWER_ABS_X/Y) — только для фокуса приложения
                 try:
                     bounds = self._mac_manager.get_front_window_bounds() if self._mac_manager else None
                 except Exception:
                     bounds = None
                 if bounds:
                     try:
-                        # перечитаем .env динамически и возьмем ANSWER_ABS_X/Y, если заданы
-                        try:
-                            load_dotenv(override=True)
-                        except Exception:
-                            pass
                         x, y, w, h = bounds
+                        ix = os.getenv("INPUT_ABS_X")
+                        iy = os.getenv("INPUT_ABS_Y")
                         ax = os.getenv("ANSWER_ABS_X")
                         ay = os.getenv("ANSWER_ABS_Y")
                         focus_x = None
                         focus_y = None
                         try:
-                            if ax is not None and ay is not None:
+                            # приоритет: INPUT_ABS -> ANSWER_ABS
+                            if ix is not None and iy is not None:
+                                ix_i = int(str(ix).strip())
+                                iy_i = int(str(iy).strip())
+                                if ix_i >= 0 and iy_i >= 0:
+                                    focus_x, focus_y = ix_i, iy_i
+                            if focus_x is None and ax is not None and ay is not None:
                                 ax_i = int(str(ax).strip())
                                 ay_i = int(str(ay).strip())
                                 if ax_i >= 0 and ay_i >= 0:
                                     focus_x, focus_y = ax_i, ay_i
                         except Exception:
                             focus_x = focus_y = None
-                        if focus_x is None or focus_y is None:
-                            # fallback: правая треть окна (панель ответа)
-                            right_third_x = x + max(0, int(w * 2 / 3))
-                            rx = max(0, right_third_x + 8)
-                            ry = max(0, y + max(0, VISUAL_REGION_TOP))
-                            rw = max(16, int(w / 3) - 16)
-                            rh = max(24, h - max(0, VISUAL_REGION_TOP) - max(0, VISUAL_REGION_BOTTOM))
-                            focus_x = rx + min(rw - 8, 24)
-                            focus_y = ry + min(rh - 8, 24)
+                        # никаких fallback-ов: кликаем только по ANSWER_ABS_X/Y; если не заданы — пропускаем клик
+
                         # Клампим координаты к экрану и (дополнительно) к окну
                         try:
                             sw, sh = pyautogui.size()
                         except Exception:
                             sw = sh = None
-                        if isinstance(sw, int) and isinstance(sh, int) and sw > 0 and sh > 0:
-                            focus_x = max(0, min(sw - 1, int(focus_x)))
-                            focus_y = max(0, min(sh - 1, int(focus_y)))
-                        # Внутри окна с небольшими отступами
-                        fx = max(x + 6, min(x + w - 6, int(focus_x)))
-                        fy = max(y + 6, min(y + h - 6, int(focus_y)))
-                        pyautogui.click(fx, fy)
-                        self.telemetry.last_click_xy = (fx, fy)
-                        time.sleep(0.15)
+                        if focus_x is not None and focus_y is not None:
+                            if isinstance(sw, int) and isinstance(sh, int) and sw > 0 and sh > 0:
+                                focus_x = max(0, min(sw - 1, int(focus_x)))
+                                focus_y = max(0, min(sh - 1, int(focus_y)))
+                            # Внутри окна с небольшими отступами
+                            fx = max(x + 6, min(x + w - 6, int(focus_x)))
+                            fy = max(y + 6, min(y + h - 6, int(focus_y)))
+                            # Защита: не кликать, если рядом с READY_PIXEL (кнопка Stop)
+                            try:
+                                if USE_READY_PIXEL and READY_PIXEL_X >= 0 and READY_PIXEL_Y >= 0:
+                                    rp_sx, rp_sy = map_ready_pixel_xy(READY_PIXEL_X, READY_PIXEL_Y, READY_PIXEL_COORD_MODE, READY_PIXEL_DX, READY_PIXEL_DY)
+                                    dx = int(fx) - int(rp_sx)
+                                    dy = int(fy) - int(rp_sy)
+                                    # Радиус запрета: чуть больше допуска цвета
+                                    ban_r = max(6, int(READY_PIXEL_TOL) + 4)
+                                    if (dx*dx + dy*dy) <= (ban_r * ban_r):
+                                        logger.info(f"Фокус‑клик близко к READY_PIXEL, ищу безопасное смещение: base=({fx},{fy}) rp=({rp_sx},{rp_sy}) r<={ban_r}")
+                                        # Попробуем несколько смещений, чтобы уйти от кнопки Stop, но остаться в окне
+                                        candidates = [
+                                            (-120, -60), (120, -60), (-160, 0), (160, 0), (0, -120), (0, 120)
+                                        ]
+                                        clicked = False
+                                        for dxo, dyo in candidates:
+                                            nfx = max(x + 6, min(x + w - 6, int(fx + dxo)))
+                                            nfy = max(y + 6, min(y + h - 6, int(fy + dyo)))
+                                            ndx = int(nfx) - int(rp_sx)
+                                            ndy = int(nfy) - int(rp_sy)
+                                            if (ndx*ndx + ndy*ndy) > (ban_r * ban_r):
+                                                logger.info(f"Фокус‑клик (offset) по координатам: ({nfx},{nfy})")
+                                                pyautogui.click(nfx, nfy)
+                                                self.telemetry.last_click_xy = (nfx, nfy)
+                                                clicked = True
+                                                break
+                                        if not clicked:
+                                            # В крайнем случае кликаем по исходной точке
+                                            logger.info(f"Фокус‑клик (forced) по координатам: ({fx},{fy})")
+                                            pyautogui.click(fx, fy)
+                                            self.telemetry.last_click_xy = (fx, fy)
+                                    else:
+                                        logger.info(f"Фокус‑клик по координатам: ({fx},{fy})")
+                                        pyautogui.click(fx, fy)
+                                        self.telemetry.last_click_xy = (fx, fy)
+                                else:
+                                    logger.info(f"Фокус‑клик по координатам: ({fx},{fy})")
+                                    pyautogui.click(fx, fy)
+                                    self.telemetry.last_click_xy = (fx, fy)
+                            except Exception:
+                                # На всякий случай делаем клик, если проверка не удалась
+                                try:
+                                    logger.info(f"Фокус‑клик (fallback) по координатам: ({fx},{fy})")
+                                    pyautogui.click(fx, fy)
+                                    self.telemetry.last_click_xy = (fx, fy)
+                                except Exception:
+                                    self.telemetry.last_click_xy = None
+                            time.sleep(0.15)
                     except Exception:
                         pass
 
@@ -899,26 +870,8 @@ class DesktopController:
 
                 # Активное ожидание готовности ответа
                 time.sleep(max(0.0, RESPONSE_WAIT_SECONDS))
-                # baseline: текущий короткий блок (обычно это предыдущий ответ)
+                # baseline: отключено, чтобы не прерывать генерацию
                 baseline_text = ""
-                if not READY_PIXEL_REQUIRED:
-                    try:
-                        pyautogui.press('esc')
-                        time.sleep(0.1)
-                        pyautogui.keyDown('shift')
-                        pyautogui.press('tab')
-                        time.sleep(0.1)
-                        pyautogui.press('tab')
-                        pyautogui.keyUp('shift')
-                        time.sleep(0.2)
-                        pyautogui.press('enter')
-                        time.sleep(0.3)
-                        pyautogui.hotkey('command', 'c')
-                        time.sleep(0.2)
-                        baseline_text = (pyperclip.paste() or "").strip()
-                        self.telemetry.last_copy_method = 'short'
-                    except Exception as e:
-                        logger.debug(f"baseline copy (macOS) failed: {e}")
                 ready, copied_text = self._wait_for_ready_mac(str(message), baseline_text)
                 copied = ready
                 if not ready and not READY_PIXEL_REQUIRED:

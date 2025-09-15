@@ -1,5 +1,6 @@
 import os
 import time
+import logging
 from typing import Tuple
 
 import pyautogui
@@ -15,6 +16,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+logger = logging.getLogger(__name__)
+
+
 def copy_from_right_panel(bounds: Tuple[int, int, int, int]) -> Tuple[str, Tuple[int, int, int, int]]:
     """Копирует текст из правой панели ответа Windsurf с помощью протяжки и автоскролла.
     Возвращает (скопированный_текст, регион_анализа_rx_ry_rw_rh).
@@ -28,33 +32,21 @@ def copy_from_right_panel(bounds: Tuple[int, int, int, int]) -> Tuple[str, Tuple
     rw = max(16, int(w / 3) - 16)
     rh = max(24, h - max(0, VISUAL_REGION_TOP) - max(0, VISUAL_REGION_BOTTOM))
 
-    # Якорь: ANSWER_WINPCT или ANSWER_ABS_X/Y
-    ans_px = ans_py = None
-    ans_raw = (os.getenv("ANSWER_WINPCT", "") or "").strip()
-    if ans_raw and "," in ans_raw:
-        try:
-            sx, sy = ans_raw.split(",", 1)
-            ans_px = float(sx.strip())
-            ans_py = float(sy.strip())
-        except Exception:
-            ans_px = ans_py = None
-    if not (isinstance(ans_px, float) and isinstance(ans_py, float)):
-        try:
-            ax = int(os.getenv("ANSWER_ABS_X", "-1"))
-            ay = int(os.getenv("ANSWER_ABS_Y", "-1"))
-            if ax >= 0 and ay >= 0:
-                start_x, start_y = ax, ay
-            else:
-                start_x = rx + max(12, int(rw * 0.66))
-                start_y = ry + max(12, rh - 24)
-        except Exception:
-            start_x = rx + max(12, int(rw * 0.66))
-            start_y = ry + max(12, rh - 24)
+    # Якорь: только ANSWER_ABS_X/Y; если не заданы — используем точку в правом нижнем секторе панели
+    try:
+        ax = int(os.getenv("ANSWER_ABS_X", "-1"))
+        ay = int(os.getenv("ANSWER_ABS_Y", "-1"))
+    except Exception:
+        ax = ay = -1
+    if ax >= 0 and ay >= 0:
+        start_x, start_y = ax, ay
     else:
-        px = max(0.0, min(1.0, ans_px))
-        py = max(0.0, min(1.0, ans_py))
-        start_x = int(x + px * w)
-        start_y = int(y + py * h)
+        start_x = rx + max(12, int(rw * 0.9))
+        start_y = ry + max(12, int(rh * 0.9))
+
+    logger.info(
+        f"copy_from_right_panel: region=(rx={rx},ry={ry},rw={rw},rh={rh}), anchor=({start_x},{start_y})"
+    )
 
     # Протяжка и автоскролл
     pyautogui.moveTo(start_x, start_y)
