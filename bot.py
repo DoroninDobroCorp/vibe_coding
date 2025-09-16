@@ -5,10 +5,12 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.exceptions import TelegramNetworkError
 from dotenv import load_dotenv
 from typing import Optional, List
 
 from windsurf_controller import desktop_controller
+from mac_window_manager import MacWindowManager
 from ai_processor import ai_processor
 import asyncio as _asyncio
 from asyncio.subprocess import PIPE as _PIPE
@@ -39,21 +41,39 @@ async def answer_chunks(message: types.Message, text: str, parse_mode: Optional[
                 split_at = max_len
             chunk = remaining[:split_at]
             remaining = remaining[split_at:]
-        await message.answer(chunk, parse_mode=parse_mode, reply_markup=(reply_markup if first else None))
+        # Пару повторных попыток на случай кратковременного обрыва соединения
+        attempts = 0
+        while True:
+            try:
+                await message.answer(chunk, parse_mode=parse_mode, reply_markup=(reply_markup if first else None))
+                break
+            except TelegramNetworkError as e:
+                attempts += 1
+                if attempts <= 2:
+                    logger.warning(f"answer_chunks retry {attempts} after TelegramNetworkError: {e}")
+                    try:
+                        await asyncio.sleep(0.7)
+                    except Exception:
+                        pass
+                    continue
+                logger.warning(f"answer_chunks give up after {attempts} attempts: {e}")
+                return
         first = False
 
 
 
-_lvl = (os.getenv("LOG_LEVEL") or "DEBUG").upper()
-_map = {
-    "CRITICAL": logging.CRITICAL,
-    "ERROR": logging.ERROR,
-    "WARNING": logging.WARNING,
-    "INFO": logging.INFO,
-    "DEBUG": logging.DEBUG,
-}
-logging.basicConfig(level=_map.get(_lvl, logging.DEBUG))
+import logging
+# Настройка логов по .env: LOG_LEVEL (DEBUG/INFO/WARNING/ERROR)
+_lvl_name = os.getenv('LOG_LEVEL', 'WARNING').upper()
+_lvl = getattr(logging, _lvl_name, logging.WARNING)
+logging.basicConfig(level=_lvl)
+# Уровни логов для библиотек: уважать LOG_LEVEL
+_lib_level = _lvl if _lvl <= logging.INFO else logging.WARNING
+logging.getLogger('aiogram').setLevel(_lib_level)
+logging.getLogger('aiohttp').setLevel(_lib_level)
+logging.getLogger('windsurf_controller').setLevel(_lib_level)
 logger = logging.getLogger(__name__)
+logger.setLevel(_lvl)
 
 # Создаем диспетчер без бота; бот будет создан в main()
 dp = Dispatcher()
@@ -102,16 +122,20 @@ main_keyboard = ReplyKeyboardMarkup(
 
 @dp.message(CommandStart())
 async def start_command(message: types.Message):
-    await message.answer(
-        "🤖 Бот для работы с Windsurf Desktop\n\n"
-        "Команды:\n"
-        "/status — статус диагностики и параметров\n"
-        "/model — управление моделью Gemini (list/set/current)\n"
-        "/git — управление Git (status/commit/push) — доступ ограничен по user_id\n"
-        "/whoami — показать ваш Telegram user_id\n\n"
-        "Просто напишите сообщение, чтобы отправить его в Windsurf!",
-        reply_markup=main_keyboard,
-    )
+    try:
+        await message.answer(
+            "🤖 Бот для работы с Windsurf Desktop\n\n"
+            "Команды:\n"
+            "/status — статус диагностики и параметров\n"
+            "/model — управление моделью API (list/set/current)\n"
+            "/wsmodel set [#N|@sub] <name> — переключить модель в UI Windsurf (Cmd+/ → ввести → Enter)\n"
+            "/git — управление Git (status/commit/push) — доступ ограничен по user_id\n"
+            "/whoami — показать ваш Telegram user_id\n\n"
+            "Просто напишите сообщение, чтобы отправить его в Windsurf!",
+            reply_markup=main_keyboard,
+        )
+    except TelegramNetworkError as e:
+        logger.warning(f"/start answer failed: {e}")
 
 
 
@@ -139,6 +163,7 @@ async def status(message: types.Message):
         f"last_visual_region: {diag.get('last_visual_region')}",
         f"last_click_xy: {diag.get('last_click_xy')}",
         f"last_ready_pixel: {diag.get('last_ready_pixel')}",
+        f"last_model_set: {diag.get('last_model_set')}",
         f"cpu_quiet_seconds: {diag.get('cpu_quiet_seconds')}",
         f"cpu_last_total_percent: {diag.get('cpu_last_total_percent')}",
         "",
@@ -180,20 +205,46 @@ async def status(message: types.Message):
 
 @dp.message(Command(commands=["windows"]))
 async def windows(message: types.Message):
+    try:
+        uid = getattr(getattr(message, 'from_user', None), 'id', None)
+        cid = getattr(getattr(message, 'chat', None), 'id', None)
+        logger.info(f"/windows from user={uid} chat={cid}")
+    except Exception:
+        pass
     titles = desktop_controller.list_windows()
-    if not titles:
-        await message.answer("Окон Windsurf не найдено или платформа не поддерживает перечисление.", reply_markup=main_keyboard)
-        return
     lines = ["🪟 Окна Windsurf:"]
-    for i, t in enumerate(titles, start=1):
-        lines.append(f"#{i}: {t}")
+    if titles:
+        for i, t in enumerate(titles, start=1):
+            lines.append(f"#{i}: {t}")
+    else:
+        lines.append("(не найдено)")
     lines.append("\nОтправляйте с префиксом: [#N] ваш текст или [@часть_заголовка] ваш текст")
-    await message.answer("\n".join(lines), reply_markup=main_keyboard)
+    # Добавим отладочную секцию с сырыми данными AppleScript
+    try:
+        mm = MacWindowManager()
+        t2, dbg = mm.list_window_titles_with_debug()
+        if t2 and t2 != titles:
+            lines.append("\n(ℹ️ fallback) Альтернативный парсер видит:")
+            for i, t in enumerate(t2, start=1):
+                lines.append(f"→ {i}: {t}")
+        if dbg:
+            lines.append("\nDebug (AppleScript):")
+            # ограничим количество строк, чтобы не заспамить чат
+            for d in dbg[:12]:
+                lines.append(f"• {d}")
+    except Exception:
+        pass
+    # Отправляем с ретраями и защитой от сетевых обрывов
+    try:
+        logger.info("/windows reply (first 2000 chars):\n" + "\n".join(lines)[:2000])
+    except Exception:
+        pass
+    await answer_chunks(message, "\n".join(lines), reply_markup=main_keyboard)
 
 
 @dp.message(Command(commands=["model"]))
 async def cmd_model(message: types.Message):
-    """Управление моделью Gemini через Telegram
+    """Управление моделью API через Telegram (через ai_processor)
     Примеры:
     /model -> помощь
     /model current
@@ -204,19 +255,26 @@ async def cmd_model(message: types.Message):
     parts = text.split()
     if len(parts) == 1:
         help_text = (
-            "⚙️ Управление моделью Gemini:\n"
+            "⚙️ Управление моделью API (через ai_processor):\n"
             "• /model current — показать текущую модель\n"
             "• /model list — список доступных моделей\n"
             "• /model list pro — список, фильтр по подстроке\n"
             "• /model set <name> — установить модель\n"
+            "\nДля переключения модели в UI Windsurf используйте: /wsmodel set [#N|@sub] <name>"
         )
-        await message.answer(help_text, reply_markup=main_keyboard)
+        try:
+            await message.answer(help_text, reply_markup=main_keyboard)
+        except TelegramNetworkError as e:
+            logger.warning(f"/model help send failed: {e}")
         return
 
     sub = parts[1].lower()
 
     if sub == "current":
-        await message.answer(f"Текущая модель: {ai_processor.get_model_name() or '—'}", reply_markup=main_keyboard)
+        try:
+            await message.answer(f"Текущая модель: {ai_processor.get_model_name() or '—'}", reply_markup=main_keyboard)
+        except TelegramNetworkError as e:
+            logger.warning(f"/model current send failed: {e}")
         return
 
     if sub == "list":
@@ -225,27 +283,101 @@ async def cmd_model(message: types.Message):
             filt = " ".join(parts[2:]).lower()
             models = [m for m in models if filt in m.lower()]
         if not models:
-            await message.answer("Список моделей пуст", reply_markup=main_keyboard)
+            try:
+                await message.answer("Список моделей пуст", reply_markup=main_keyboard)
+            except TelegramNetworkError as e:
+                logger.warning(f"/model list empty send failed: {e}")
             return
         lines = ["📚 Доступные модели:"] + [f"• {m}" for m in models[:100]]
-        await message.answer("\n".join(lines), reply_markup=main_keyboard)
+        try:
+            await message.answer("\n".join(lines), reply_markup=main_keyboard)
+        except TelegramNetworkError as e:
+            logger.warning(f"/model list send failed: {e}")
         return
 
     if sub == "set" and len(parts) >= 3:
         new_model = " ".join(parts[2:]).strip()
         ok, msg = ai_processor.set_model(new_model)
         prefix = "✅" if ok else "❌"
-        await message.answer(f"{prefix} {msg}", reply_markup=main_keyboard)
+        try:
+            await message.answer(f"{prefix} {msg}", reply_markup=main_keyboard)
+        except TelegramNetworkError as e:
+            logger.warning(f"/model set send failed: {e}")
         return
 
     await message.answer("Неизвестная подкоманда. Используйте /model для помощи.", reply_markup=main_keyboard)
+
+
+def _parse_target_prefix(s: str) -> tuple[Optional[str], str]:
+    """Парсинг префикса [#N] или [@substr] в начале строки. Возвращает (target, rest)."""
+    import re
+    s = (s or "").strip()
+    m = re.match(r"^\[(#\d+|@[^\]]+)\]\s*(.*)$", s)
+    if not m:
+        return None, s
+    token = m.group(1)
+    rest = m.group(2).strip()
+    if token.startswith('#') and token[1:].isdigit():
+        return f"index:{int(token[1:])}", rest
+    if token.startswith('@'):
+        return token[1:], rest
+    return None, s
+
+
+@dp.message(Command(commands=["wsmodel"]))
+async def cmd_wsmodel(message: types.Message):
+    """Переключение модели в UI Windsurf через командную палитру (Cmd+/, ввести имя, Enter).
+    Примеры:
+    /wsmodel set <name>
+    /wsmodel set [#2] <name>
+    /wsmodel set [@title_sub] <name>
+    """
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=2)
+    if len(parts) < 2:
+        try:
+            await message.answer(
+                "⚙️ Переключение модели в UI Windsurf:\n"
+                "• /wsmodel set <name> — активное окно\n"
+                "• /wsmodel set [#N] <name> — окно по индексу в /windows\n"
+                "• /wsmodel set [@часть_заголовка] <name> — окно по части заголовка\n"
+                "Принцип: Cmd+/ → ввести <name> → Enter",
+                reply_markup=main_keyboard,
+            )
+        except TelegramNetworkError as e:
+            logger.warning(f"/wsmodel help send failed: {e}")
+        return
+    sub = (parts[1] or "").lower()
+    if sub != 'set':
+        try:
+            await message.answer("Неизвестная подкоманда. Используйте: /wsmodel set ...", reply_markup=main_keyboard)
+        except TelegramNetworkError as e:
+            logger.warning(f"/wsmodel unknown send failed: {e}")
+        return
+    if len(parts) < 3:
+        try:
+            await message.answer("Укажите имя модели: /wsmodel set <name>", reply_markup=main_keyboard)
+        except TelegramNetworkError as e:
+            logger.warning(f"/wsmodel no name send failed: {e}")
+        return
+    payload = parts[2]
+    target, name = _parse_target_prefix(payload)
+    if not name:
+        await message.answer("Пустое имя модели", reply_markup=main_keyboard)
+        return
+    ok, msg = desktop_controller.set_model_ui(name, target or "active")
+    prefix = "✅" if ok else "❌"
+    await message.answer(f"{prefix} {msg}", reply_markup=main_keyboard)
 
 
 @dp.message(Command(commands=["whoami"]))
 async def cmd_whoami(message: types.Message):
     uid = message.from_user.id if message.from_user else None
     uname = message.from_user.username if message.from_user else None
-    await message.answer(f"Ваш user_id: {uid}\nusername: @{uname}", reply_markup=main_keyboard)
+    try:
+        await message.answer(f"Ваш user_id: {uid}\nusername: @{uname}", reply_markup=main_keyboard)
+    except TelegramNetworkError as e:
+        logger.warning(f"/whoami send failed: {e}")
 
 
 async def _get_git_root_for(chat_id: int | None, user_id: int | None) -> str:
@@ -323,7 +455,10 @@ def _git_enabled_for(user_id: int) -> bool:
 
 @dp.message(Command(commands=["git"]))
 async def cmd_git(message: types.Message):
-    await message.answer("❌ Команда /git отключена в этой сборке.", reply_markup=main_keyboard)
+    try:
+        await message.answer("❌ Команда /git отключена в этой сборке.", reply_markup=main_keyboard)
+    except TelegramNetworkError as e:
+        logger.warning(f"/git send failed: {e}")
 
 
 @dp.message()
@@ -362,7 +497,10 @@ async def handle_message(message: types.Message):
                 pass
 
         # Отправляем сообщение в Windsurf
-        await message.answer("🔄 Отправляю запрос в Windsurf...")
+        try:
+            await message.answer("🔄 Отправляю запрос в Windsurf...")
+        except TelegramNetworkError as e:
+            logger.warning(f"pre-send notice failed: {e}")
         copied_response = None
         diag = None
         if target:
@@ -375,25 +513,28 @@ async def handle_message(message: types.Message):
         if not success:
             diag = desktop_controller.get_diagnostics()
             reason = diag.get("last_error") or "Неизвестно"
-            await message.answer(
-                "❌ Ошибка при отправке сообщения\n"
-                f"Причина: {reason}\n"
-                f"Платформа: {diag.get('platform')}\n"
-                f"Windsurf процессов: {len(diag.get('windsurf_pids', []))}\n"
-                f"last_paste_strategy: {diag.get('last_paste_strategy')}\n"
-                f"last_copy_method: {diag.get('last_copy_method')}\n"
-                f"last_copy_length: {diag.get('last_copy_length')}\n"
-                f"last_copy_is_echo: {diag.get('last_copy_is_echo')}\n"
-                f"response_wait_loops: {diag.get('response_wait_loops')}\n"
-                f"response_ready_time: {diag.get('response_ready_time')}s\n"
-                f"response_stabilized: {diag.get('response_stabilized')}\n"
-                f"response_stabilized_by: {diag.get('response_stabilized_by')}\n"
-                f"last_ui_button: {diag.get('last_ui_button')}\n"
-                f"last_ui_avg_color: {diag.get('last_ui_avg_color')}\n"
-                f"last_visual_region: {diag.get('last_visual_region')}\n"
-                f"last_click_xy: {diag.get('last_click_xy')}",
-                reply_markup=main_keyboard,
-            )
+            try:
+                await message.answer(
+                    "❌ Ошибка при отправке сообщения\n"
+                    f"Причина: {reason}\n"
+                    f"Платформа: {diag.get('platform')}\n"
+                    f"Windsurf процессов: {len(diag.get('windsurf_pids', []))}\n"
+                    f"last_paste_strategy: {diag.get('last_paste_strategy')}\n"
+                    f"last_copy_method: {diag.get('last_copy_method')}\n"
+                    f"last_copy_length: {diag.get('last_copy_length')}\n"
+                    f"last_copy_is_echo: {diag.get('last_copy_is_echo')}\n"
+                    f"response_wait_loops: {diag.get('response_wait_loops')}\n"
+                    f"response_ready_time: {diag.get('response_ready_time')}s\n"
+                    f"response_stabilized: {diag.get('response_stabilized')}\n"
+                    f"response_stabilized_by: {diag.get('response_stabilized_by')}\n"
+                    f"last_ui_button: {diag.get('last_ui_button')}\n"
+                    f"last_ui_avg_color: {diag.get('last_ui_avg_color')}\n"
+                    f"last_visual_region: {diag.get('last_visual_region')}\n"
+                    f"last_click_xy: {diag.get('last_click_xy')}",
+                    reply_markup=main_keyboard,
+                )
+            except TelegramNetworkError as e:
+                logger.warning(f"send error details failed: {e}")
             return
 
         # 2) Строгий режим по опорному пикселю — сообщаем об ожидании только после успешной отправки
@@ -405,10 +546,13 @@ async def handle_message(message: types.Message):
             by = (diag or {}).get("response_stabilized_by")
             last_rp = (diag or {}).get("last_ready_pixel") or {}
             if by != "ready_pixel" or not last_rp.get("match", False):
-                await message.answer(
-                    "⏳ Ждём готовности ответа: контрольная точка ещё не совпала (READY_PIXEL).",
-                    reply_markup=main_keyboard,
-                )
+                try:
+                    await message.answer(
+                        "⏳ Ждём готовности ответа: контрольная точка ещё не совпала (READY_PIXEL).",
+                        reply_markup=main_keyboard,
+                    )
+                except TelegramNetworkError as e:
+                    logger.warning(f"ready wait notify failed: {e}")
                 return
 
         # Получаем скопированный ответ:
@@ -444,16 +588,22 @@ async def handle_message(message: types.Message):
             hint = (
                 "Попробуйте: увеличить RESPONSE_WAIT_SECONDS, повторить запрос, или сфокусировать окно Windsurf."
             )
-            await message.answer(
-                f"⚠️ Ответ не удалось получить из буфера обмена.{echo_note}\n{hint}",
-                reply_markup=main_keyboard,
-            )
+            try:
+                await message.answer(
+                    f"⚠️ Ответ не удалось получить из буфера обмена.{echo_note}\n{hint}",
+                    reply_markup=main_keyboard,
+                )
+            except TelegramNetworkError as e:
+                logger.warning(f"fallback notify failed: {e}")
 
         # OCR/калибровка удалены из проекта, поэтому дополнительные блоки не используются
 
     except Exception as e:
         logger.error(f"Error: {e}")
-        await message.answer("❌ Произошла ошибка при обработке запроса")
+        try:
+            await message.answer("❌ Произошла ошибка при обработке запроса")
+        except TelegramNetworkError:
+            pass
 
 
 async def main():
@@ -463,7 +613,15 @@ async def main():
         logger.error("TELEGRAM_BOT_TOKEN не задан. Создайте .env и укажите токен.")
         return
     bot = Bot(token=token)
-    await dp.start_polling(bot)
+    try:
+        try:
+            me = await bot.get_me()
+            logger.info(f"Bot is up: @{getattr(me, 'username', None)} id={getattr(me, 'id', None)}")
+        except Exception as e:
+            logger.warning(f"get_me failed: {e}")
+        await dp.start_polling(bot)
+    except (KeyboardInterrupt, TelegramNetworkError) as e:
+        logger.warning(f"Bot stopped: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())

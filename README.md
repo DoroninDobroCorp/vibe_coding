@@ -17,6 +17,10 @@ This project is a Telegram bot that sends your messages to the `Windsurf Desktop
 - Telegram‑статус и диагностика: `/status`, `/windows`, `/model`, `/whoami`.
 - Корректное оповещение об ошибке отправки в Telegram при неуспехе (до ожидания READY_PIXEL).
 
+> ⚠️ Ограничения (временные):
+> - Тестирование через Telethon (скрипт `telethon_bot.py`) сейчас не поддерживается.
+> - Полноценная поддержка нескольких окон Windsurf (адресная отправка в конкретное окно) пока не работает.
+
 ## EN — Features
 - Send messages to the active Windsurf window from Telegram.
 - macOS window targeting: `[ #N ] text` or `[ @title_substring ] text`.
@@ -27,6 +31,10 @@ This project is a Telegram bot that sends your messages to the `Windsurf Desktop
 - Echo filtering and prompt‑suffix extraction.
 - Telegram diagnostics: `/status`, `/windows`, `/model`, `/whoami`.
 - Proper Telegram error reporting if sending fails (before READY_PIXEL waiting).
+
+> ⚠️ Limitations (temporary):
+> - Testing via Telethon (`telethon_bot.py`) is not supported at the moment.
+> - Full multi‑window support (targeted sending into a specific window) is currently not working.
 
 ---
 

@@ -13,7 +13,11 @@ from mac_window_manager import MacWindowManager
 from selection import copy_from_right_panel
 from clipboard_utils import copy_to_clipboard as cb_copy, paste_from_clipboard_mac as cb_paste_mac
 from text_filter import clean_copied_text, extract_answer_by_prompt
-from PIL import ImageChops, ImageStat
+from PIL import ImageChops, ImageStat, Image
+try:
+    import psutil  # для диагностики процессов Windsurf
+except Exception:
+    psutil = None
 try:
     # Импорты специфичные для Windows
     from pywinauto import Application
@@ -39,6 +43,32 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 WINDSURF_WINDOW_TITLE = os.getenv("WINDSURF_WINDOW_TITLE")
+
+# Диагностика процессов Windsurf для /status
+def _scan_windsurf_processes():
+    """Вернёт список процессов Windsurf с полями pid, name, cpu_percent. Безопасно при отсутствии psutil."""
+    if psutil is None:
+        return []
+    procs = []
+    try:
+        for p in psutil.process_iter(["pid", "name", "cmdline", "cpu_percent"]):
+            try:
+                name = (p.info.get("name") or "")
+                pid = int(p.info.get("pid") or p.pid)
+                cpu = float(p.info.get("cpu_percent") or 0.0)
+                cmd = p.info.get("cmdline") or []
+                name_l = str(name).lower()
+                cmd_s = " ".join(cmd).lower() if isinstance(cmd, list) else str(cmd).lower()
+                if "windsurf" in name_l or "windsurf" in cmd_s:
+                    procs.append({"pid": pid, "name": name, "cpu_percent": round(cpu, 2)})
+            except Exception:
+                continue
+    except Exception as e:
+        try:
+            logger.debug(f"_scan_windsurf_processes failed: {e}")
+        except Exception:
+            pass
+    return procs
 
 # Параметры через ENV (с дефолтами)
 def _env_int(name: str, default: int) -> int:
@@ -94,6 +124,7 @@ ECHO_MAX_DELTA = _env_int("ECHO_MAX_DELTA", 64)
 ECHO_LEN_RATIO = _env_float("ECHO_LEN_RATIO", 1.4)
 USE_READY_PIXEL = os.getenv("USE_READY_PIXEL", "1") not in ("0", "false", "False")
 READY_PIXEL_REQUIRED = os.getenv("READY_PIXEL_REQUIRED", "0") not in ("0", "false", "False")
+TRIM_AFTER_PROMPT = os.getenv("TRIM_AFTER_PROMPT", "1") not in ("0", "false", "False")
 READY_PIXEL_X = _env_int("READY_PIXEL_X", -1)
 READY_PIXEL_Y = _env_int("READY_PIXEL_Y", -1)
 READY_PIXEL_R = _env_int("READY_PIXEL_R", 225)
@@ -104,13 +135,26 @@ READY_PIXEL_TOL_PCT = _env_float("READY_PIXEL_TOL_PCT", -1.0)  # если >=0, �
 READY_PIXEL_COORD_MODE = os.getenv("READY_PIXEL_COORD_MODE", "top").strip().lower()
 READY_PIXEL_DX = _env_int("READY_PIXEL_DX", 0)
 READY_PIXEL_DY = _env_int("READY_PIXEL_DY", 0)
-READY_PIXEL_PROBE_INTERVAL_SECONDS = _env_float("READY_PIXEL_PROBE_INTERVAL_SECONDS", 7.0)
+READY_PIXEL_PROBE_INTERVAL_SECONDS = _env_float("READY_PIXEL_PROBE_INTERVAL_SECONDS", 5.0)
+READY_PIXEL_AVG_K = _env_int("READY_PIXEL_AVG_K", 1)
+# Дополнительные требования к детекции опорного пикселя
+READY_PIXEL_REQUIRE_TRANSITION = os.getenv("READY_PIXEL_REQUIRE_TRANSITION", "1") not in ("0", "false", "False")
+READY_PIXEL_STABLE_SECONDS = _env_float("READY_PIXEL_STABLE_SECONDS", 0.8)
+READY_PIXEL_TRANSITION_TIMEOUT_SECONDS = _env_float("READY_PIXEL_TRANSITION_TIMEOUT_SECONDS", 25.0)
 CLICK_ABS_X = _env_int("CLICK_ABS_X", -1)
 CLICK_ABS_Y = _env_int("CLICK_ABS_Y", -1)
 
 # Отладка опорного пикселя: по умолчанию сохраняем только при совпадении и не сохраняем гипотезы
 SAVE_READY_HYPOTHESES = os.getenv("SAVE_READY_HYPOTHESES", "0") not in ("0", "false", "False")
 SAVE_READY_ONLY_ON_MATCH = os.getenv("SAVE_READY_ONLY_ON_MATCH", "1") not in ("0", "false", "False")
+# Периодический перезахват .env во время ожидания (секунды)
+ENV_RELOAD_INTERVAL_SECONDS = _env_float("ENV_RELOAD_INTERVAL_SECONDS", 2.0)
+READY_PIXEL_RELOAD_ENV = os.getenv("READY_PIXEL_RELOAD_ENV", "0") not in ("0", "false", "False")
+
+# UI-модель: подтверждающий клик вместо Enter и политика буфера обмена
+WSMODEL_CONFIRM_CLICK_X = _env_int("WSMODEL_CONFIRM_CLICK_X", 1040)
+WSMODEL_CONFIRM_CLICK_Y = _env_int("WSMODEL_CONFIRM_CLICK_Y", 720)
+WSMODEL_RESTORE_CLIPBOARD = os.getenv("WSMODEL_RESTORE_CLIPBOARD", "1") not in ("0", "false", "False")
 
 
 def map_ready_pixel_xy(rp_x: int, rp_y: int, rp_mode: str | None = None, rp_dx: int | None = None, rp_dy: int | None = None) -> tuple[int, int]:
@@ -123,6 +167,7 @@ def map_ready_pixel_xy(rp_x: int, rp_y: int, rp_mode: str | None = None, rp_dx: 
         rp_dx = int(os.getenv("READY_PIXEL_DX", str(READY_PIXEL_DX)))
     if rp_dy is None:
         rp_dy = int(os.getenv("READY_PIXEL_DY", str(READY_PIXEL_DY)))
+
     x2, y2 = int(rp_x) + int(rp_dx), int(rp_y) + int(rp_dy)
     if rp_mode == 'flipy':
         # инвертируем только по режиму, без ограничения экраном
@@ -142,22 +187,164 @@ def map_ready_pixel_xy(rp_x: int, rp_y: int, rp_mode: str | None = None, rp_dx: 
     # default 'top'
     return x2, y2
 
-def _scan_windsurf_processes():
+def _rgb_at(x: int, y: int):
+    """Надёжное чтение цвета в координатах экрана (top-origin)."""
     try:
-        import psutil
-        pids = []
-        for proc in psutil.process_iter(['pid', 'name']):
-            try:
-                name = (proc.info.get('name') or '').lower()
-                if 'windsurf' in name:
-                    pids.append(proc.info['pid'])
-            except Exception:
-                continue
-        return pids
-    except Exception as e:
-        logger.debug(f"psutil scan error: {e}")
-        return []
+        r, g, b = pyautogui.pixel(int(x), int(y))
+        return int(r), int(g), int(b)
+    except Exception:
+        try:
+            img = pyautogui.screenshot(region=(int(x), int(y), 1, 1))
+            p = img.getpixel((0, 0))
+            if isinstance(p, tuple) and len(p) >= 3:
+                return int(p[0]), int(p[1]), int(p[2])
+            v = int(p[0] if isinstance(p, tuple) else p)
+            return v, v, v
+        except Exception:
+            return 0, 0, 0
 
+def _sanitize_k(k: int) -> int:
+    try:
+        k = int(k)
+    except Exception:
+        k = 1
+    if k < 1:
+        k = 1
+    if k > 9:
+        k = 9
+    if k % 2 == 0:
+        k += 1
+    return k
+
+def _avg_rgb(x: int, y: int, k: int) -> tuple[int, int, int]:
+    """Усреднение по kxk вокруг (x,y) прямыми вызовами pixel()."""
+    k = _sanitize_k(k)
+    if k == 1:
+        return _rgb_at(x, y)
+    r = k // 2
+    acc = [0, 0, 0]
+    cnt = 0
+    try:
+        sw, sh = pyautogui.size()
+    except Exception:
+        sw = sh = 0
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            xi = int(x + dx)
+            yi = int(y + dy)
+            if sw and sh:
+                if xi < 0 or yi < 0 or xi >= sw or yi >= sh:
+                    xi = max(0, min(sw - 1, xi))
+                    yi = max(0, min(sh - 1, yi))
+            try:
+                pr, pg, pb = pyautogui.pixel(xi, yi)
+                acc[0] += int(pr); acc[1] += int(pg); acc[2] += int(pb)
+                cnt += 1
+            except Exception:
+                pass
+    if cnt <= 0:
+        return _rgb_at(x, y)
+    return acc[0] // cnt, acc[1] // cnt, acc[2] // cnt
+
+def _avg_rgb_via_screencapture(x: int, y: int, k: int) -> tuple[int, int, int]:
+    """Усреднение по kxk с использованием 'screencapture -R' (устойчиво на ретине/мульти-мониторе)."""
+    k = _sanitize_k(k)
+    r = k // 2
+    rx = int(x - r)
+    ry = int(y - r)
+    cw = int(k)
+    ch = int(k)
+    tmp_path = None
+    img = None
+    try:
+        os.makedirs(SAVE_VISUAL_DIR, exist_ok=True)
+        tmp_path = os.path.join(SAVE_VISUAL_DIR, f"_rp_tmp_{int(time.time()*1000)}.png")
+        cmd = ["screencapture", "-x", "-R", f"{rx},{ry},{cw},{ch}", tmp_path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0 and os.path.exists(tmp_path):
+            try:
+                img = Image.open(tmp_path).convert('RGB')
+            except Exception:
+                img = None
+    except Exception:
+        img = None
+    finally:
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+    if img is None:
+        # Фоллбэк — pyautogui.screenshot
+        try:
+            img = pyautogui.screenshot(region=(rx, ry, cw, ch)).convert('RGB')
+        except Exception:
+            return _rgb_at(x, y)
+    acc_r = acc_g = acc_b = 0
+    cnt = 0
+    try:
+        for iy in range(img.height):
+            for ix in range(img.width):
+                pr, pg, pb = img.getpixel((ix, iy))
+                acc_r += int(pr); acc_g += int(pg); acc_b += int(pb)
+                cnt += 1
+    except Exception:
+        return _rgb_at(x, y)
+    if cnt <= 0:
+        return _rgb_at(x, y)
+    return acc_r // cnt, acc_g // cnt, acc_b // cnt
+
+def _sample_rgb_consistent(x: int, y: int, avg_k: int) -> tuple[int, int, int]:
+    """Сэмплирование цвета согласованно с color_pipette: по умолчанию через screencapture, с усреднением."""
+    try:
+        return _avg_rgb_via_screencapture(x, y, avg_k)
+    except Exception:
+        try:
+            return _avg_rgb(x, y, avg_k)
+        except Exception:
+            return _rgb_at(x, y)
+
+def _pick_ready_src(default: str = 'cap') -> str:
+    s = (os.getenv('READY_PIXEL_SRC') or default).strip().lower()
+    if s not in ('auto', 'cap', 'dir'):
+        s = default
+    return s
+
+def _measure_ready_pixel_rgb(x: int, y: int, avg_k: int, target: tuple[int, int, int] | None = None) -> tuple[tuple[int, int, int], str]:
+    """Измерить RGB в точке (x,y) для READY_PIXEL в соответствии с READY_PIXEL_SRC={cap|dir|auto}.
+    Возвращает ((r,g,b), used_src).
+    При auto выбирается источник, дающий меньшую дельту до target; при отсутствии target — предпочитаем cap,
+    но если cap выглядит как подозрительно белый (255,255,255), берём dir.
+    """
+    src = _pick_ready_src('cap')
+    avg_k = max(1, int(avg_k))
+    if src == 'cap':
+        return (_avg_rgb_via_screencapture(x, y, avg_k), 'cap')
+    if src == 'dir':
+        return (_avg_rgb(x, y, avg_k), 'dir')
+    # auto
+    rgb_cap = _avg_rgb_via_screencapture(x, y, avg_k)
+    rgb_dir = _avg_rgb(x, y, avg_k)
+    used = 'cap'
+    rgb = rgb_cap
+    if target and isinstance(target, tuple) and len(target) >= 3:
+        d_cap = abs(int(rgb_cap[0]) - int(target[0])) + abs(int(rgb_cap[1]) - int(target[1])) + abs(int(rgb_cap[2]) - int(target[2]))
+        d_dir = abs(int(rgb_dir[0]) - int(target[0])) + abs(int(rgb_dir[1]) - int(target[1])) + abs(int(rgb_dir[2]) - int(target[2]))
+        if d_dir < d_cap:
+            rgb, used = rgb_dir, 'dir'
+        else:
+            rgb, used = rgb_cap, 'cap'
+    else:
+        def _is_white(c: tuple[int, int, int]) -> bool:
+            try:
+                return int(c[0]) >= 254 and int(c[1]) >= 254 and int(c[2]) >= 254
+            except Exception:
+                return False
+        if _is_white(rgb_cap) and not _is_white(rgb_dir):
+            rgb, used = rgb_dir, 'dir'
+        else:
+            rgb, used = rgb_cap, 'cap'
+    return (rgb, used)
 
 class _Telemetry:
     def __init__(self):
@@ -181,6 +368,7 @@ class _Telemetry:
         self.last_visual_region = None  # (rx, ry, rw, rh)
         self.last_click_xy = None  # (x, y)
         self.last_ready_pixel = None  # {'x':..,'y':..,'rgb':(r,g,b),'match':bool,'delta':(dr,dg,db)}
+        self.last_model_set = None  # UI: last requested model name
 
     def as_dict(self):
         return {
@@ -206,6 +394,7 @@ class _Telemetry:
             "last_visual_region": self.last_visual_region,
             "last_click_xy": self.last_click_xy,
             "last_ready_pixel": self.last_ready_pixel,
+            "last_model_set": self.last_model_set,
         }
 
 
@@ -289,6 +478,17 @@ class DesktopController:
         По готовности копируем весь текст и извлекаем суффикс относительно baseline.
         """
         start = time.time()
+        last_ready_probe = 0.0  # Время последней проверки READY_PIXEL
+        # Для логики стабильности и перехода non-match -> match
+        seen_nonmatch = False
+        match_started_at = None
+        transition_deadline = None
+        try:
+            _transition_timeout = float(READY_PIXEL_TRANSITION_TIMEOUT_SECONDS)
+        except Exception:
+            _transition_timeout = 25.0
+        if READY_PIXEL_REQUIRE_TRANSITION:
+            transition_deadline = (start + _transition_timeout) if _transition_timeout and _transition_timeout > 0 else None
         # READY_PIXEL-only режим: не отправляем никаких хоткеев во время ожидания
         baseline_full = ""
         logger.info("macOS: ожидание READY_PIXEL — без отправки каких-либо клавиш/копирования до готовности")
@@ -297,10 +497,17 @@ class DesktopController:
         ready_by = None  # 'visual' | 'pixel'
         # Визуальная стабилизация — отключено (оставляем только READY_PIXEL)
         visual_prev_small = None
-        visual_last_change = start
+        last_visual_change = start
         last_visual_sample = 0.0
+        # Упростили детекцию: без edge/стабилизации и без динамической перезагрузки .env
+        last_env_reload = start - ENV_RELOAD_INTERVAL_SECONDS
 
-        while time.time() - start < max(0.0, RESPONSE_MAX_WAIT_SECONDS):
+        # Если RESPONSE_MAX_WAIT_SECONDS<=0 — ждём бесконечно (пока не совпадёт READY_PIXEL)
+        while True:
+            # Прерывание по таймауту только если он задан (>0)
+            if RESPONSE_MAX_WAIT_SECONDS and RESPONSE_MAX_WAIT_SECONDS > 0:
+                if time.time() - start >= RESPONSE_MAX_WAIT_SECONDS:
+                    break
             loops += 1
 
             # 1) Визуальная стабилизация — отключено намеренно
@@ -357,9 +564,12 @@ class DesktopController:
                 if ui_state == 'send':
                     ready_by = 'pixel'
 
-            # 3) Датчик готовности по опорному пикселю (абсолютные координаты)
-            if ready_by is None and USE_READY_PIXEL and READY_PIXEL_X >= 0 and READY_PIXEL_Y >= 0:
+            # 3) Датчик готовности по опорному пикселю (абсолютные координаты) с edge-логикой
+            if ready_by is None and USE_READY_PIXEL and READY_PIXEL_X >= 0 and READY_PIXEL_Y >= 0 \
+               and (time.time() - last_ready_probe) >= READY_PIXEL_PROBE_INTERVAL_SECONDS:
+                last_ready_probe = time.time()
                 try:
+                    # Динамическая перезагрузка .env отключена по умолчанию для стабильности измерения
                     rp_x = int(os.getenv("READY_PIXEL_X", str(READY_PIXEL_X)))
                     rp_y = int(os.getenv("READY_PIXEL_Y", str(READY_PIXEL_Y)))
                     rp_r = int(os.getenv("READY_PIXEL_R", str(READY_PIXEL_R)))
@@ -372,7 +582,10 @@ class DesktopController:
                     rp_dy = int(os.getenv("READY_PIXEL_DY", str(READY_PIXEL_DY)))
 
                     sx, sy = map_ready_pixel_xy(rp_x, rp_y, rp_mode, rp_dx, rp_dy)
-                    pr, pg, pb = pyautogui.pixel(sx, sy)
+                    # Сэмплируем цвет с учетом READY_PIXEL_SRC (auto|cap|dir), как в пипетке (status)
+                    (pr, pg, pb), used_src = _measure_ready_pixel_rgb(
+                        int(sx), int(sy), max(1, int(READY_PIXEL_AVG_K)), (rp_r, rp_g, rp_b)
+                    )
                     dr = abs(int(pr) - rp_r)
                     dg = abs(int(pg) - rp_g)
                     db = abs(int(pb) - rp_b)
@@ -388,19 +601,41 @@ class DesktopController:
                     )
                     self.telemetry.last_ready_pixel = {
                         'x': rp_x, 'y': rp_y, 'used_xy': (sx, sy), 'mode': rp_mode, 'dxdy': (rp_dx, rp_dy),
-                        'rgb': (int(pr), int(pg), int(pb)),
+                        'rgb': (int(pr), int(pg), int(pb)), 'src': used_src,
                         'target': (rp_r, rp_g, rp_b),
                         'tol': rp_tol,
                         'tol_pct': rp_tol_pct if rp_tol_pct is not None and rp_tol_pct >= 0 else None,
                         'delta': (dr, dg, db), 'match': match,
                     }
+                    # Логика перехода (edge)
+                    now_ts = time.time()
                     if not match:
+                        seen_nonmatch = True
+                        match_started_at = None
                         logger.info(
                             "READY_PIXEL проверка: used_xy=(%d,%d) цвет=(%d,%d,%d) не подходит; жду %.1fs",
                             sx, sy, int(pr), int(pg), int(pb), READY_PIXEL_PROBE_INTERVAL_SECONDS
                         )
                         time.sleep(READY_PIXEL_PROBE_INTERVAL_SECONDS)
                         continue
+                    # Тут match == True
+                    if READY_PIXEL_REQUIRE_TRANSITION and not seen_nonmatch:
+                        # Требуем увидеть хотя бы один non-match после отправки
+                        # Если задан таймаут перехода и он истёк — либо принимаем (если timeout<=0 не задан), либо продолжаем ждать
+                        if transition_deadline is not None and now_ts >= transition_deadline:
+                            logger.info("READY_PIXEL: переход non-match->match не зафиксирован до таймаута, продолжаю ожидать совпадение...")
+                            time.sleep(READY_PIXEL_PROBE_INTERVAL_SECONDS)
+                            continue
+                    # Стабильность совпадения
+                    if match_started_at is None:
+                        match_started_at = now_ts
+                    stable_for = now_ts - match_started_at
+                    if stable_for < max(0.0, READY_PIXEL_STABLE_SECONDS):
+                        logger.info("READY_PIXEL: совпадение, но ждём стабильность %.1fs (уже %.2fs)", READY_PIXEL_STABLE_SECONDS, stable_for)
+                        time.sleep(READY_PIXEL_PROBE_INTERVAL_SECONDS)
+                        continue
+                    # Все условия выполнены
+                    ready_by = 'ready_pixel'
                     # Сохраняем снимки (умолчание: только при совпадении и не сохраняем гипотезы)
                     if SAVE_VISUAL_DEBUG:
                         try:
@@ -562,8 +797,8 @@ class DesktopController:
                     except Exception:
                         short_txt = ''
                 disable_echo = (ready_by in ('ready_pixel', 'pixel'))
-                # Обрежем всё до и включая вопрос, чтобы оставить только ответ
-                processed_short = extract_answer_by_prompt(str(message), short_txt) if READY_PIXEL_REQUIRED else short_txt
+                # Обрезка по запросу и очистка от UI-шума
+                processed_short = extract_answer_by_prompt(str(message), short_txt) if TRIM_AFTER_PROMPT else short_txt
                 if processed_short and (disable_echo or not self._looks_like_echo(str(message), processed_short)):
                     copied_text = processed_short
                     self.telemetry.last_copy_is_echo = False
@@ -651,8 +886,8 @@ class DesktopController:
                         final_full = ""
             except Exception:
                 final_full = ""
-            # Обрежем ответ по последнему вхождению вопроса, если строгий режим включён
-            if READY_PIXEL_REQUIRED and final_full:
+            # Обрезка по запросу и очистка от UI-шума
+            if TRIM_AFTER_PROMPT and final_full:
                 try:
                     final_full = extract_answer_by_prompt(str(message), final_full)
                 except Exception:
@@ -712,7 +947,6 @@ class DesktopController:
         self.telemetry.response_stabilized_by = ready_by if ready else None
         return ready, copied_text
     
-
 
     def _ensure_windsurf_frontmost_mac(self, target: str | None) -> bool:
         """Сфокусировать Windsurf и, при необходимости, конкретное окно.
@@ -1039,7 +1273,7 @@ class DesktopController:
 
                 # Обрезка по запросу и очистка от UI-шума
                 try:
-                    processed = extract_answer_by_prompt(str(message), copied_text or "") if READY_PIXEL_REQUIRED else (copied_text or "")
+                    processed = extract_answer_by_prompt(str(message), copied_text or "") if TRIM_AFTER_PROMPT else (copied_text or "")
                     cleaned = clean_copied_text(str(message), processed)
                     if cleaned:
                         pyperclip.copy(cleaned)
@@ -1090,6 +1324,94 @@ class DesktopController:
         except Exception as e:
             logger.debug(f"list_windows failed: {e}")
         return []
+
+    def set_model_ui(self, model_name: str, target: str | None = None) -> tuple[bool, str]:
+        """Переключить модель в UI Windsurf (macOS): Cmd+/, ввести имя модели, Enter.
+        target: None/"active" или 'index:N'/'<substring>' — см. _ensure_windsurf_frontmost_mac.
+        Возвращает (ok, message)."""
+        try:
+            # Dry-run режим для самотестов: не трогаем UI, только фиксируем телеметрию
+            if os.getenv("WSMODEL_DRY_RUN", "0").lower() not in ("0", "false"):
+                self.telemetry.last_model_set = str(model_name)
+                logger.info(f"[DRY-RUN] UI: (skip) переключил модель Windsurf -> {model_name}")
+                return True, f"(dry-run) Модель переключена: {model_name}"
+            if platform.system() != "Darwin":
+                return False, "UI model switching поддерживается только на macOS"
+            # Сфокусировать нужное окно Windsurf
+            self._ensure_windsurf_frontmost_mac(target or "active")
+            time.sleep(0.2)
+            # Кликнуть в правую панель (ANSWER_ABS_X/Y), чтобы гарантировать фокус перед Cmd+/
+            try:
+                ax = int(os.getenv("ANSWER_ABS_X", "-1"))
+                ay = int(os.getenv("ANSWER_ABS_Y", "-1"))
+            except Exception:
+                ax = ay = -1
+            if ax >= 0 and ay >= 0:
+                try:
+                    sw, sh = pyautogui.size()
+                except Exception:
+                    sw = sh = 0
+                cx = max(0, min(sw - 1, int(ax))) if sw else int(ax)
+                cy = max(0, min(sh - 1, int(ay))) if sh else int(ay)
+                try:
+                    pyautogui.moveTo(cx, cy, duration=0.05)
+                    pyautogui.click()
+                    self.telemetry.last_click_xy = (cx, cy)
+                    time.sleep(0.15)
+                except Exception:
+                    pass
+            # Открыть палитру команд и ввести запрос (через буфер, чтобы избежать раскладки)
+            pyautogui.hotkey('command', '/')
+            time.sleep(0.25)
+            # Очистим строку
+            pyautogui.hotkey('command', 'a')
+            time.sleep(0.05)
+            # Подготовим буфер обмена
+            old_clip = None
+            try:
+                if WSMODEL_RESTORE_CLIPBOARD:
+                    old_clip = pyperclip.paste()
+            except Exception:
+                old_clip = None
+            try:
+                pyperclip.copy(str(model_name))
+                time.sleep(0.05)
+            except Exception:
+                pass
+            pyautogui.hotkey('command', 'v')
+            time.sleep(0.2)
+            # Подтверждение кликом (вместо Enter)
+            try:
+                sw, sh = pyautogui.size()
+            except Exception:
+                sw = sh = 0
+            cx = int(WSMODEL_CONFIRM_CLICK_X)
+            cy = int(WSMODEL_CONFIRM_CLICK_Y)
+            if cx >= 0 and cy >= 0:
+                ccx = max(0, min((sw - 1) if sw else cx, cx))
+                ccy = max(0, min((sh - 1) if sh else cy, cy))
+                try:
+                    pyautogui.moveTo(ccx, ccy, duration=0.05)
+                    pyautogui.click()
+                    time.sleep(0.2)
+                except Exception:
+                    # Фоллбэк — Enter, если клик не удался
+                    pyautogui.press('enter')
+            else:
+                pyautogui.press('enter')
+            # Восстановим буфер, если нужно
+            try:
+                if WSMODEL_RESTORE_CLIPBOARD and (old_clip is not None):
+                    pyperclip.copy(old_clip)
+            except Exception:
+                pass
+            self.telemetry.last_model_set = str(model_name)
+            logger.info(f"UI: переключил модель Windsurf -> {model_name}")
+            return True, f"Модель переключена: {model_name}"
+        except Exception as e:
+            self.telemetry.last_error = f"set_model_ui failed: {e}"
+            logger.warning(f"set_model_ui failed: {e}")
+            return False, f"Ошибка переключения модели: {e}"
 
 
 desktop_controller = DesktopController()

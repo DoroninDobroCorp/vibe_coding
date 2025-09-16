@@ -59,17 +59,46 @@ def copy_from_right_panel(bounds: Tuple[int, int, int, int]) -> Tuple[str, Tuple
     except Exception as e:
         logger.debug(f"[Copy] Вспомогательный клик пропущен: {e}")
     
-    # Протяжка и автоскролл
-    pyautogui.moveTo(start_x, start_y)
-    pyautogui.mouseDown(start_x, start_y)
-    time.sleep(0.05)
-    pyautogui.moveTo(rx + 12, ry + 12, duration=0.2)
-    for _ in range(10):
-        pyautogui.scroll(500)
-        time.sleep(0.04)
-    pyautogui.mouseUp(rx + 12, ry + 12)
-    time.sleep(0.1)
-    
+    # 1) Явная протяжка по координатам из .env (если заданы)
+    try:
+        drag_sx = _env_int("COPY_DRAG_START_X", 0)
+        drag_sy = _env_int("COPY_DRAG_START_Y", 0)
+        drag_ex = _env_int("COPY_DRAG_END_X", 0)
+        drag_ey = _env_int("COPY_DRAG_END_Y", 0)
+        try:
+            drag_hold = float(os.getenv("COPY_DRAG_HOLD_SECONDS", "5.0"))
+        except Exception:
+            drag_hold = 5.0
+    except Exception:
+        drag_sx = drag_sy = drag_ex = drag_ey = 0
+        drag_hold = 5.0
+
+    if drag_sx > 0 and drag_sy > 0 and drag_ex > 0 and drag_ey > 0:
+        logger.info(f"[Copy] Протяжка по координатам: start=({drag_sx},{drag_sy}) -> end=({drag_ex},{drag_ey}), hold={drag_hold:.2f}s")
+        try:
+            pyautogui.moveTo(drag_sx, drag_sy)
+            pyautogui.mouseDown(drag_sx, drag_sy)
+            time.sleep(0.05)
+            pyautogui.moveTo(drag_ex, drag_ey, duration=0.25)
+            time.sleep(max(0.1, drag_hold))  # удержание
+            pyautogui.mouseUp(drag_ex, drag_ey)
+            time.sleep(0.2)
+        except Exception as e:
+            logger.debug(f"[Copy] Явная протяжка не удалась: {e}\n[Copy] Пробую fallback с автоскроллом")
+            drag_sx = drag_sy = drag_ex = drag_ey = 0
+
+    if not (drag_sx > 0 and drag_sy > 0 and drag_ex > 0 and drag_ey > 0):
+        # 2) Fallback: Протяжка и автоскролл в рамках правой панели
+        pyautogui.moveTo(start_x, start_y)
+        pyautogui.mouseDown(start_x, start_y)
+        time.sleep(0.05)
+        pyautogui.moveTo(rx + 12, ry + 12, duration=0.2)
+        for _ in range(10):
+            pyautogui.scroll(500)
+            time.sleep(0.04)
+        pyautogui.mouseUp(rx + 12, ry + 12)
+        time.sleep(0.1)
+
     # Копирование с логированием
     pyautogui.hotkey('command', 'c')
     time.sleep(0.3)  # Увеличена задержка для надежности
