@@ -19,7 +19,6 @@ This project is a Telegram bot that sends your messages to the `Windsurf Desktop
 
 > ⚠️ Ограничения (временные):
 > - Тестирование через Telethon (скрипт `telethon_bot.py`) сейчас не поддерживается.
-> - Полноценная поддержка нескольких окон Windsurf (адресная отправка в конкретное окно) пока не работает.
 
 ## EN — Features
 - Send messages to the active Windsurf window from Telegram.
