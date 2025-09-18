@@ -1028,7 +1028,12 @@ class DesktopController:
         try:
             if system == "Darwin":  # macOS путь
                 logger.info("macOS: активируем приложение Windsurf")
-                self._ensure_windsurf_frontmost_mac(target or "active")
+                focused_ok = self._ensure_windsurf_frontmost_mac(target or "active")
+                if target and not focused_ok:
+                    logger.warning(f"Фокусировка на целевом окне не удалась: target={target}")
+                    self.telemetry.last_error = f"focus failed for target: {target}"
+                    self.telemetry.failed_sends += 1
+                    return False
 
                 # 1) Гарантируем фокус кликом по полю ввода (если заданы INPUT_ABS_X/Y),
                 #    иначе кликом в область ответа (ANSWER_ABS_X/Y) — только для фокуса приложения
@@ -1427,12 +1432,19 @@ class DesktopController:
                 sw = sh = 0
             cx = int(WSMODEL_CONFIRM_CLICK_X)
             cy = int(WSMODEL_CONFIRM_CLICK_Y)
-            # Спец. условие для /wsmodel set: проверяем белый пиксель в (1204,728)
-            # Если он "белый" (>=254 по всем каналам), то финальный клик смещаем на (1130,695).
+            # Спец. условие для /wsmodel set: проверяем пиксель в точке (по умолчанию 1179,728)
+            # Если он "белый" (>=254 по всем каналам), то финальный клик смещаем на безопасную точку
             # Делаем двойное измерение (direct + screencapture) и логируем детали.
             try:
                 # Кламп координаты измерения в пределах экрана
-                sx, sy = 1204, 728
+                try:
+                    sx = int(os.getenv("WSMODEL_PROBE_X", "1179").strip())
+                except Exception:
+                    sx = 1179
+                try:
+                    sy = int(os.getenv("WSMODEL_PROBE_Y", "728").strip())
+                except Exception:
+                    sy = 728
                 if sw and sh:
                     sx = max(0, min(sw - 1, sx))
                     sy = max(0, min(sh - 1, sy))
@@ -1452,8 +1464,17 @@ class DesktopController:
                     sx, sy, int(pr1), int(pg1), int(pb1), int(pr2), int(pg2), int(pb2), is_white_direct, is_white_cap,
                 )
                 if is_white_direct or is_white_cap:
-                    logger.info("wsmodel confirm: белый фон обнаружен — смещаю клик на (1130,695)")
-                    cx, cy = 1130, 695
+                    # Безопасная точка подтверждения (ENV override)
+                    try:
+                        safe_x = int(os.getenv("WSMODEL_CONFIRM_SAFE_X", "1130").strip())
+                    except Exception:
+                        safe_x = 1130
+                    try:
+                        safe_y = int(os.getenv("WSMODEL_CONFIRM_SAFE_Y", "695").strip())
+                    except Exception:
+                        safe_y = 695
+                    logger.info("wsmodel confirm: белый фон обнаружен — смещаю клик на (%d,%d)", safe_x, safe_y)
+                    cx, cy = safe_x, safe_y
                 else:
                     logger.info("wsmodel confirm: белый фон НЕ обнаружен — кликаю по стандартным (%d,%d)", cx, cy)
             except Exception as e:
@@ -1515,8 +1536,10 @@ class DesktopController:
             self.telemetry.last_error = f"newchat_click failed: {e}"
             return False, f"Ошибка newchat: {e}"
 
-    def change_project(self, folder_name: str) -> tuple[bool, str]:
-        """Открыть папку ~/VovkaNowEngineer/<folder_name> в текущем окне Windsurf и развернуть на весь экран (macOS)."""
+    def change_project(self, folder_name: str, target: str | None = None) -> tuple[bool, str]:
+        """Открыть папку ~/VovkaNowEngineer/<folder_name> в указанном окне Windsurf и развернуть на весь экран (macOS).
+        target: None/"active" или 'index:N'/'<substring>' — см. _ensure_windsurf_frontmost_mac.
+        """
         try:
             if not folder_name or not str(folder_name).strip():
                 return False, "Папка не указана"
@@ -1528,7 +1551,7 @@ class DesktopController:
                 # 1) UI-путь (предпочтительно): переиспользовать текущее окно через Cmd+O → Cmd+Shift+G → путь → Enter → Enter
                 try:
                     logger.info("change_project: switching to %s via Open dialog in current window", dest)
-                    self._ensure_windsurf_frontmost_mac("active")
+                    self._ensure_windsurf_frontmost_mac(target or "active")
                 except Exception:
                     pass
                 time.sleep(0.2)
@@ -1567,7 +1590,15 @@ class DesktopController:
                             sw, sh = pyautogui.size()
                         except Exception:
                             sw = sh = 0
-                        tx, ty = 1205, 15
+                        # Точка финальной проверки (ENV override), по умолчанию 1205,15
+                        try:
+                            tx = int(os.getenv("CHANGE_FINAL_PROBE_X", "1205").strip())
+                        except Exception:
+                            tx = 1205
+                        try:
+                            ty = int(os.getenv("CHANGE_FINAL_PROBE_Y", "15").strip())
+                        except Exception:
+                            ty = 15
                         if sw and sh:
                             tx = max(0, min(sw - 1, tx))
                             ty = max(0, min(sh - 1, ty))
@@ -1608,7 +1639,7 @@ class DesktopController:
                         if rc.returncode == 0:
                             time.sleep(0.8)
                             try:
-                                self._ensure_windsurf_frontmost_mac("active")
+                                self._ensure_windsurf_frontmost_mac(target or "active")
                             except Exception:
                                 pass
                             pyautogui.hotkey('command', 'control', 'f')
@@ -1622,7 +1653,15 @@ class DesktopController:
                                     sw, sh = pyautogui.size()
                                 except Exception:
                                     sw = sh = 0
-                                tx, ty = 1205, 15
+                                # Точка финальной проверки (ENV override), по умолчанию 1205,15
+                                try:
+                                    tx = int(os.getenv("CHANGE_FINAL_PROBE_X", "1205").strip())
+                                except Exception:
+                                    tx = 1205
+                                try:
+                                    ty = int(os.getenv("CHANGE_FINAL_PROBE_Y", "15").strip())
+                                except Exception:
+                                    ty = 15
                                 if sw and sh:
                                     tx = max(0, min(sw - 1, tx))
                                     ty = max(0, min(sh - 1, ty))

@@ -104,6 +104,9 @@ CHAT_GIT_ROOT_OVERRIDE: dict[int, str] = {}
 # По пользователю (user_id -> path)
 GIT_ROOT_OVERRIDE: dict[int, str] = {}
 
+# Последний список окон по чату (для стабильного маппинга [#N] -> заголовок)
+LAST_WINDOWS_BY_CHAT: dict[int, List[str]] = {}
+
 # Глобальное хранилище состояний
 user_states = (
     {}
@@ -247,6 +250,14 @@ async def windows(message: types.Message):
     else:
         lines.append("• /wsmodel set [#1] gemini-2.5-pro")
         lines.append("• /wsmodel set [@vibe_coding] gpt-4o")
+    # Сохраним список окон для текущего чата — пригодится для стабильного маппинга индекса
+    try:
+        cid = getattr(getattr(message, 'chat', None), 'id', None)
+        if isinstance(cid, int) and titles:
+            LAST_WINDOWS_BY_CHAT[cid] = titles[:]
+    except Exception:
+        pass
+
     # Показать отладку только если явно включено
     show_dbg = os.getenv("WINDOWS_SHOW_DEBUG", "0").lower() not in ("0", "false", "no")
     if show_dbg:
@@ -422,19 +433,56 @@ async def cmd_newchat(message: types.Message):
 
 @dp.message(Command(commands=["change"]))
 async def cmd_change(message: types.Message):
-    """Открыть проект в ~/VovkaNowEngineer/<name>.
-    Использование: /change <name>
+    """Открыть проект в ~/VovkaNowEngineer/<name> в конкретном окне.
+    Использование:
+    /change <name>
+    /change [#N] <name>
+    /change [@часть_заголовка] <name>
     """
     text = (message.text or "").strip()
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
+    # Обрежем команду
+    payload = text[len("/change"):].strip() if text.lower().startswith("/change") else text
+    if not payload:
         try:
-            await message.answer("Укажите имя папки: /change <name>", reply_markup=main_keyboard)
+            await message.answer(
+                "Укажите имя папки. Примеры:\n"
+                "/change lazy\n"
+                "/change [#2] lazy\n"
+                "/change [@vibe_coding] lazy",
+                reply_markup=main_keyboard,
+            )
         except TelegramNetworkError as e:
             logger.warning(f"/change help send failed: {e}")
         return
-    folder = parts[1].strip()
-    ok, msg = desktop_controller.change_project(folder)
+    # Парсим префикс [#N]/[@sub]
+    target, rest = _parse_target_prefix(payload)
+    folder = (rest or payload).strip()
+    if not folder:
+        try:
+            await message.answer("Папка не указана: /change [#N|@sub] <name>", reply_markup=main_keyboard)
+        except TelegramNetworkError as e:
+            logger.warning(f"/change folder missing send failed: {e}")
+        return
+    # Если это индекс — маппим к точному заголовку окна (по чату) для стабильного фокуса
+    if target and target.startswith("index:"):
+        try:
+            idx = int(target.split(":", 1)[1])
+        except Exception:
+            idx = -1
+        try:
+            cid = getattr(getattr(message, 'chat', None), 'id', None)
+        except Exception:
+            cid = None
+        if isinstance(cid, int):
+            arr = LAST_WINDOWS_BY_CHAT.get(cid) or []
+            if not arr:
+                try:
+                    arr = desktop_controller.list_windows() or []
+                except Exception:
+                    arr = []
+            if 1 <= idx <= len(arr):
+                target = arr[idx - 1]
+    ok, msg = desktop_controller.change_project(folder, target or "active")
     prefix = "✅" if ok else "❌"
     try:
         await message.answer(f"{prefix} {msg}", reply_markup=main_keyboard)
@@ -538,25 +586,29 @@ async def handle_message(message: types.Message):
     #     return
 
     try:
-        # Парсинг таргета окна: [#N] или [@title]
-        target = None
-        text = user_input
-        if user_input.startswith("[#"):
+        # Единый парсер префикса [#N]/[@sub]
+        target, text = _parse_target_prefix(user_input)
+        # Если это индекс и у нас есть "свежий" список окон для чата — маппим к полному заголовку
+        if target and target.startswith("index:"):
             try:
-                close = user_input.find("]")
-                num = int(user_input[2:close])
-                target = f"index:{num}"
-                text = user_input[close + 1 :].strip()
+                idx = int(target.split(":", 1)[1])
             except Exception:
-                pass
-        elif user_input.startswith("[@"):
+                idx = -1
             try:
-                close = user_input.find("]")
-                title = user_input[2:close]
-                target = title.strip()
-                text = user_input[close + 1 :].strip()
+                cid = getattr(getattr(message, 'chat', None), 'id', None)
             except Exception:
-                pass
+                cid = None
+            if isinstance(cid, int):
+                arr = LAST_WINDOWS_BY_CHAT.get(cid) or []
+                if not arr:
+                    # Возьмём актуальный список окон прямо сейчас
+                    try:
+                        arr = desktop_controller.list_windows() or []
+                    except Exception:
+                        arr = []
+                if 1 <= idx <= len(arr):
+                    # Передаём полный заголовок как подстроку — устойчивее при fullscreen/Spaces
+                    target = arr[idx - 1]
 
         # Отправляем сообщение в Windsurf
         try:
