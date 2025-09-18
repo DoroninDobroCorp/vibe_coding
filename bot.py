@@ -67,11 +67,18 @@ import logging
 _lvl_name = os.getenv('LOG_LEVEL', 'WARNING').upper()
 _lvl = getattr(logging, _lvl_name, logging.WARNING)
 logging.basicConfig(level=_lvl)
-# Уровни логов для библиотек: уважать LOG_LEVEL
-_lib_level = _lvl if _lvl <= logging.INFO else logging.WARNING
-logging.getLogger('aiogram').setLevel(_lib_level)
-logging.getLogger('aiohttp').setLevel(_lib_level)
-logging.getLogger('windsurf_controller').setLevel(_lib_level)
+
+# Максимально приглушаем сторонние логи
+logging.getLogger('aiogram').setLevel(logging.WARNING)
+logging.getLogger('aiogram.event').setLevel(logging.WARNING)
+logging.getLogger('aiohttp').setLevel(logging.WARNING)
+logging.getLogger('PIL').setLevel(logging.WARNING)
+logging.getLogger('PIL.PngImagePlugin').setLevel(logging.ERROR)
+
+# Оставляем подробные логи только для контроллера
+logging.getLogger('windsurf_controller').setLevel(logging.INFO)
+logging.getLogger('mac_window_manager').setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 logger.setLevel(_lvl)
 
@@ -129,6 +136,8 @@ async def start_command(message: types.Message):
             "/status — статус диагностики и параметров\n"
             "/model — управление моделью API (list/set/current)\n"
             "/wsmodel set [#N|@sub] <name> — переключить модель в UI Windsurf (Cmd+/ → ввести → Enter)\n"
+            "/newchat — открыть новый чат (клик по 1192,51)\n"
+            "/change <name> — открыть проект из ~/VovkaNowEngineer/<name> в Windsurf\n"
             "/git — управление Git (status/commit/push) — доступ ограничен по user_id\n"
             "/whoami — показать ваш Telegram user_id\n\n"
             "Просто напишите сообщение, чтобы отправить его в Windsurf!",
@@ -218,22 +227,42 @@ async def windows(message: types.Message):
             lines.append(f"#{i}: {t}")
     else:
         lines.append("(не найдено)")
-    lines.append("\nОтправляйте с префиксом: [#N] ваш текст или [@часть_заголовка] ваш текст")
-    # Добавим отладочную секцию с сырыми данными AppleScript
-    try:
-        mm = MacWindowManager()
-        t2, dbg = mm.list_window_titles_with_debug()
-        if t2 and t2 != titles:
-            lines.append("\n(ℹ️ fallback) Альтернативный парсер видит:")
-            for i, t in enumerate(t2, start=1):
-                lines.append(f"→ {i}: {t}")
-        if dbg:
-            lines.append("\nDebug (AppleScript):")
-            # ограничим количество строк, чтобы не заспамить чат
-            for d in dbg[:12]:
-                lines.append(f"• {d}")
-    except Exception:
-        pass
+    # Подсказки по адресации и примеры смены модели в конкретном окне
+    lines.append("\nАдресация окна:")
+    lines.append("[#N] — по номеру в списке, [@часть_заголовка] — по подстроке")
+    lines.append("\nПримеры смены модели в конкретном окне:")
+    if titles:
+        # Подберём пару наглядных примеров на основе актуальных окон
+        ex1_idx = 1
+        ex1_model = os.getenv("WSMODEL_EXAMPLE1", "gemini-2.5-pro")
+        lines.append(f"• /wsmodel set [#{ex1_idx}] {ex1_model}")
+        # Пример по подстроке title
+        first_title = titles[0]
+        # возьмём первую 'слово/подстроку' из заголовка без спецсимволов как удобную метку
+        import re as _re
+        token = _re.sub(r"[^\w\-А-Яа-я]+", " ", first_title).strip().split()
+        sub = token[0] if token else first_title[:10]
+        ex2_model = os.getenv("WSMODEL_EXAMPLE2", "gpt-4o")
+        lines.append(f"• /wsmodel set [@{sub}] {ex2_model}")
+    else:
+        lines.append("• /wsmodel set [#1] gemini-2.5-pro")
+        lines.append("• /wsmodel set [@vibe_coding] gpt-4o")
+    # Показать отладку только если явно включено
+    show_dbg = os.getenv("WINDOWS_SHOW_DEBUG", "0").lower() not in ("0", "false", "no")
+    if show_dbg:
+        try:
+            mm = MacWindowManager()
+            t2, dbg = mm.list_window_titles_with_debug()
+            if t2 and t2 != titles:
+                lines.append("\n(ℹ️ fallback) Альтернативный парсер видит:")
+                for i, t in enumerate(t2, start=1):
+                    lines.append(f"→ {i}: {t}")
+            if dbg:
+                lines.append("\nDebug (AppleScript):")
+                for d in dbg[:12]:
+                    lines.append(f"• {d}")
+        except Exception:
+            pass
     # Отправляем с ретраями и защитой от сетевых обрывов
     try:
         logger.info("/windows reply (first 2000 chars):\n" + "\n".join(lines)[:2000])
@@ -378,6 +407,39 @@ async def cmd_whoami(message: types.Message):
         await message.answer(f"Ваш user_id: {uid}\nusername: @{uname}", reply_markup=main_keyboard)
     except TelegramNetworkError as e:
         logger.warning(f"/whoami send failed: {e}")
+
+
+@dp.message(Command(commands=["newchat"]))
+async def cmd_newchat(message: types.Message):
+    """Открыть новый чат кликом по координатам (1192,51)."""
+    try:
+        ok, msg = desktop_controller.newchat_click()
+        prefix = "✅" if ok else "❌"
+        await message.answer(f"{prefix} {msg}", reply_markup=main_keyboard)
+    except TelegramNetworkError as e:
+        logger.warning(f"/newchat send failed: {e}")
+
+
+@dp.message(Command(commands=["change"]))
+async def cmd_change(message: types.Message):
+    """Открыть проект в ~/VovkaNowEngineer/<name>.
+    Использование: /change <name>
+    """
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        try:
+            await message.answer("Укажите имя папки: /change <name>", reply_markup=main_keyboard)
+        except TelegramNetworkError as e:
+            logger.warning(f"/change help send failed: {e}")
+        return
+    folder = parts[1].strip()
+    ok, msg = desktop_controller.change_project(folder)
+    prefix = "✅" if ok else "❌"
+    try:
+        await message.answer(f"{prefix} {msg}", reply_markup=main_keyboard)
+    except TelegramNetworkError as e:
+        logger.warning(f"/change send failed: {e}")
 
 
 async def _get_git_root_for(chat_id: int | None, user_id: int | None) -> str:

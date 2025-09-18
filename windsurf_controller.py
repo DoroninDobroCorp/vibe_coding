@@ -957,24 +957,64 @@ class DesktopController:
             # Активируем приложение
             subprocess.run(["osascript", "-e", 'tell application "Windsurf" to activate'], check=False)
             time.sleep(0.3)
-            # Если задан таргет окна — пытаемся фокусировать его
+            # Если задан таргет окна — пытаемся сфокусировать его
+            desired_title: str | None = None
+            desired_sub: str | None = None
             if target and target not in ("active", "default"):
                 if target.startswith("index:"):
-                    idx = int(target.split(":", 1)[1])
-                    ok = self._mac_manager.focus_by_index(idx)
-                    if not ok:
-                        logger.warning(f"Не удалось сфокусировать окно по индексу: {idx}")
+                    # Маппим индекс на заголовок из списка, чтобы избежать расхождений индексов в полноэкранном режиме
+                    try:
+                        idx = int(target.split(":", 1)[1])
+                    except Exception:
+                        idx = -1
+                    titles = []
+                    try:
+                        titles = self._mac_manager.list_window_titles() or []
+                    except Exception:
+                        titles = []
+                    if 1 <= idx <= len(titles):
+                        desired_title = titles[idx - 1]
+                        # Сначала пытаемся через меню Window/Окно (стабильно для полноэкранных)
+                        ok = self._mac_manager.focus_by_title_menu(desired_title)
+                        if not ok:
+                            # Фоллбек: Accessibility индекс
+                            ok = self._mac_manager.focus_by_index(idx)
+                        if not ok and desired_title:
+                            # Фоллбек: подстрока из заголовка
+                            ok = self._mac_manager.focus_by_title_substring(desired_title)
+                        if not ok:
+                            logger.warning(f"Не удалось сфокусировать окно по индексу: {idx} -> '{desired_title}'")
+                    else:
+                        logger.warning(f"Некорректный индекс окна: {idx}; доступно: {len(titles)}")
                 else:
-                    ok = self._mac_manager.focus_by_title_substring(target)
+                    desired_sub = str(target)
+                    # Сначала меню Window/Окно, затем Accessibility по подстроке
+                    ok = self._mac_manager.focus_by_title_menu(desired_sub)
+                    if not ok:
+                        ok = self._mac_manager.focus_by_title_substring(desired_sub)
                     if not ok:
                         logger.warning(f"Не удалось сфокусировать окно по заголовку: {target}")
-            # Ждем, пока Windsurf станет frontmost
+            # Ждем, пока Windsurf станет frontmost; по возможности проверим, что активирован нужный заголовок
             start = time.time()
             while time.time() - start < FRONTMOST_WAIT_SECONDS:
                 if self._mac_manager.is_frontmost():
-                    return True
+                    if desired_title or desired_sub:
+                        try:
+                            ft = self._mac_manager.get_front_window_title() or ""
+                        except Exception:
+                            ft = ""
+                        if desired_title:
+                            l = ft.strip().lower(); r = desired_title.strip().lower()
+                            if l == r or (l and r and (l in r or r in l)):
+                                return True
+                        elif desired_sub:
+                            if desired_sub.strip().lower() in ft.strip().lower():
+                                return True
+                        # Иначе подождём ещё чуть-чуть
+                    else:
+                        return True
                 time.sleep(0.1)
-            logger.warning("Windsurf не стал frontmost за отведенное время")
+            logger.warning("Windsurf не стал frontmost или активировался не тот заголовок за отведенное время")
             return False
         except Exception as e:
             logger.debug(f"ensure frontmost failed: {e}")
@@ -1387,10 +1427,42 @@ class DesktopController:
                 sw = sh = 0
             cx = int(WSMODEL_CONFIRM_CLICK_X)
             cy = int(WSMODEL_CONFIRM_CLICK_Y)
+            # Спец. условие для /wsmodel set: проверяем белый пиксель в (1204,728)
+            # Если он "белый" (>=254 по всем каналам), то финальный клик смещаем на (1130,695).
+            # Делаем двойное измерение (direct + screencapture) и логируем детали.
+            try:
+                # Кламп координаты измерения в пределах экрана
+                sx, sy = 1204, 728
+                if sw and sh:
+                    sx = max(0, min(sw - 1, sx))
+                    sy = max(0, min(sh - 1, sy))
+                # Переместим курсор к точке проверки и подождём 1.5s, чтобы визуально видеть где измеряем
+                try:
+                    logger.info("wsmodel confirm: навожу курсор на точку проверки (%d,%d) и жду 1.5s", sx, sy)
+                    pyautogui.moveTo(sx, sy, duration=0.05)
+                except Exception:
+                    pass
+                time.sleep(1.5)
+                pr1, pg1, pb1 = _rgb_at(sx, sy)
+                pr2, pg2, pb2 = _avg_rgb_via_screencapture(sx, sy, 1)
+                is_white_direct = (int(pr1) >= 254 and int(pg1) >= 254 and int(pb1) >= 254)
+                is_white_cap = (int(pr2) >= 254 and int(pg2) >= 254 and int(pb2) >= 254)
+                logger.info(
+                    "wsmodel confirm probe @(%d,%d): direct=(%d,%d,%d) cap=(%d,%d,%d) -> white_direct=%s white_cap=%s",
+                    sx, sy, int(pr1), int(pg1), int(pb1), int(pr2), int(pg2), int(pb2), is_white_direct, is_white_cap,
+                )
+                if is_white_direct or is_white_cap:
+                    logger.info("wsmodel confirm: белый фон обнаружен — смещаю клик на (1130,695)")
+                    cx, cy = 1130, 695
+                else:
+                    logger.info("wsmodel confirm: белый фон НЕ обнаружен — кликаю по стандартным (%d,%d)", cx, cy)
+            except Exception as e:
+                logger.warning(f"wsmodel confirm probe failed: {e}")
             if cx >= 0 and cy >= 0:
                 ccx = max(0, min((sw - 1) if sw else cx, cx))
                 ccy = max(0, min((sh - 1) if sh else cy, cy))
                 try:
+                    logger.info("wsmodel confirm click at (%d,%d) [clamped from (%d,%d)]", ccx, ccy, cx, cy)
                     pyautogui.moveTo(ccx, ccy, duration=0.05)
                     pyautogui.click()
                     time.sleep(0.2)
@@ -1412,6 +1484,179 @@ class DesktopController:
             self.telemetry.last_error = f"set_model_ui failed: {e}"
             logger.warning(f"set_model_ui failed: {e}")
             return False, f"Ошибка переключения модели: {e}"
+
+
+    def newchat_click(self, target: str | None = None) -> tuple[bool, str]:
+        """Клик по координатам (1192, 51) для открытия нового чата в UI Windsurf (macOS)."""
+        try:
+            if platform.system() != "Darwin":
+                return False, "Команда поддерживается только на macOS"
+            # Сфокусировать окно Windsurf
+            try:
+                self._ensure_windsurf_frontmost_mac(target or "active")
+            except Exception:
+                pass
+            time.sleep(0.1)
+            try:
+                sw, sh = pyautogui.size()
+            except Exception:
+                sw = sh = 0
+            x, y = 1192, 51
+            cx = max(0, min((sw - 1) if sw else x, x))
+            cy = max(0, min((sh - 1) if sh else y, y))
+            try:
+                pyautogui.moveTo(cx, cy, duration=0.05)
+                pyautogui.click()
+                self.telemetry.last_click_xy = (cx, cy)
+            except Exception as e:
+                return False, f"Клик не удался: {e}"
+            return True, "Новый чат открыт (клик по координатам)"
+        except Exception as e:
+            self.telemetry.last_error = f"newchat_click failed: {e}"
+            return False, f"Ошибка newchat: {e}"
+
+    def change_project(self, folder_name: str) -> tuple[bool, str]:
+        """Открыть папку ~/VovkaNowEngineer/<folder_name> в текущем окне Windsurf и развернуть на весь экран (macOS)."""
+        try:
+            if not folder_name or not str(folder_name).strip():
+                return False, "Папка не указана"
+            base = os.path.join(os.path.expanduser("~"), "VovkaNowEngineer")
+            dest = os.path.join(base, folder_name.strip())
+            if not os.path.isdir(dest):
+                return False, f"Каталог не найден: {dest}"
+            if platform.system() == "Darwin":
+                # 1) UI-путь (предпочтительно): переиспользовать текущее окно через Cmd+O → Cmd+Shift+G → путь → Enter → Enter
+                try:
+                    logger.info("change_project: switching to %s via Open dialog in current window", dest)
+                    self._ensure_windsurf_frontmost_mac("active")
+                except Exception:
+                    pass
+                time.sleep(0.2)
+                try:
+                    pyautogui.hotkey('command', 'o')
+                    time.sleep(0.35)
+                    pyautogui.hotkey('command', 'shift', 'g')  # Go to Folder
+                    time.sleep(0.25)
+                    old_clip = None
+                    if WSMODEL_RESTORE_CLIPBOARD:
+                        try:
+                            old_clip = pyperclip.paste()
+                        except Exception:
+                            old_clip = None
+                    try:
+                        pyperclip.copy(dest)
+                        time.sleep(0.07)
+                    except Exception:
+                        pass
+                    pyautogui.hotkey('command', 'v')
+                    time.sleep(0.12)
+                    pyautogui.press('enter')  # go
+                    time.sleep(0.35)
+                    pyautogui.press('enter')  # open in current window
+                    # Дать времени окну перегрузиться
+                    time.sleep(0.8)
+                    # Разворачиваем в полноэкранный режим (macOS стандарт)
+                    pyautogui.hotkey('command', 'control', 'f')
+                    # Подождём, чтобы UI устаканился, прежде чем проверять пиксель
+                    logger.info("change_project: жду 3s перед финальной проверкой пикселя...")
+                    time.sleep(3.0)
+                    # Финальное действие: кликнуть в (1205,15), НО пропустить,
+                    # если цвет равен 127,126,122 или 51,51,51 (по direct или screencapture)
+                    try:
+                        try:
+                            sw, sh = pyautogui.size()
+                        except Exception:
+                            sw = sh = 0
+                        tx, ty = 1205, 15
+                        if sw and sh:
+                            tx = max(0, min(sw - 1, tx))
+                            ty = max(0, min(sh - 1, ty))
+                        # Наведём курсор к точке финальной проверки и дадим время 1.5s
+                        try:
+                            logger.info("change_project: навожу курсор на точку финальной проверки (%d,%d) и жду 1.5s", tx, ty)
+                            pyautogui.moveTo(tx, ty, duration=0.05)
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        r1, g1, b1 = _rgb_at(tx, ty)
+                        r2, g2, b2 = _avg_rgb_via_screencapture(tx, ty, 1)
+                        forbid1 = (int(r1) == 127 and int(g1) == 126 and int(b1) == 122) or (int(r1) == 51 and int(g1) == 51 and int(b1) == 51)
+                        forbid2 = (int(r2) == 127 and int(g2) == 126 and int(b2) == 122) or (int(r2) == 51 and int(g2) == 51 and int(b2) == 51)
+                        logger.info(
+                            "change_project final probe @(1205,15)->@(%d,%d): direct=(%d,%d,%d) cap=(%d,%d,%d) forbid_direct=%s forbid_cap=%s",
+                            tx, ty, int(r1), int(g1), int(b1), int(r2), int(g2), int(b2), forbid1, forbid2,
+                        )
+                        if not (forbid1 or forbid2):
+                            pyautogui.moveTo(tx, ty, duration=0.05)
+                            pyautogui.click()
+                            logger.info("change_project: финальный клик по (%d,%d)", tx, ty)
+                        else:
+                            logger.info("change_project: финальный клик пропущен из-за запрещённого цвета")
+                    except Exception as _e:
+                        logger.warning(f"change_project final click check failed: {_e}")
+                    if WSMODEL_RESTORE_CLIPBOARD and (old_clip is not None):
+                        try:
+                            pyperclip.copy(old_clip)
+                        except Exception:
+                            pass
+                    return True, f"Открыт проект и развернут на весь экран: {dest}"
+                except Exception as e:
+                    logger.warning(f"change_project UI path failed: {e}; trying 'open -a' fallback")
+                    # 2) Фоллбэк: open -a (может открыть в новом окне). После открытия — разворачиваем.
+                    try:
+                        rc = subprocess.run(["open", "-a", "Windsurf", dest], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        if rc.returncode == 0:
+                            time.sleep(0.8)
+                            try:
+                                self._ensure_windsurf_frontmost_mac("active")
+                            except Exception:
+                                pass
+                            pyautogui.hotkey('command', 'control', 'f')
+                            # Подождём, чтобы UI устаканился, прежде чем проверять пиксель
+                            logger.info("change_project (fallback): жду 3s перед финальной проверкой пикселя...")
+                            time.sleep(3.0)
+                            # Финальное действие: кликнуть в (1205,15), НО пропустить,
+                            # если цвет равен 127,126,122 или 51,51,51 (по direct или screencapture)
+                            try:
+                                try:
+                                    sw, sh = pyautogui.size()
+                                except Exception:
+                                    sw = sh = 0
+                                tx, ty = 1205, 15
+                                if sw and sh:
+                                    tx = max(0, min(sw - 1, tx))
+                                    ty = max(0, min(sh - 1, ty))
+                                # Наведём курсор к точке финальной проверки и дадим время 1.5s
+                                try:
+                                    logger.info("change_project(fallback): навожу курсор на точку финальной проверки (%d,%d) и жду 1.5s", tx, ty)
+                                    pyautogui.moveTo(tx, ty, duration=0.05)
+                                except Exception:
+                                    pass
+                                time.sleep(1.5)
+                                r1, g1, b1 = _rgb_at(tx, ty)
+                                r2, g2, b2 = _avg_rgb_via_screencapture(tx, ty, 1)
+                                forbid1 = (int(r1) == 127 and int(g1) == 126 and int(b1) == 122) or (int(r1) == 51 and int(g1) == 51 and int(b1) == 51)
+                                forbid2 = (int(r2) == 127 and int(g2) == 126 and int(b2) == 122) or (int(r2) == 51 and int(g2) == 51 and int(b2) == 51)
+                                logger.info(
+                                    "change_project final probe @(1205,15)->@(%d,%d): direct=(%d,%d,%d) cap=(%d,%d,%d) forbid_direct=%s forbid_cap=%s",
+                                    tx, ty, int(r1), int(g1), int(b1), int(r2), int(g2), int(b2), forbid1, forbid2,
+                                )
+                                if not (forbid1 or forbid2):
+                                    pyautogui.moveTo(tx, ty, duration=0.05)
+                                    pyautogui.click()
+                                    logger.info("change_project: финальный клик по (%d,%d)", tx, ty)
+                                else:
+                                    logger.info("change_project: финальный клик пропущен из-за запрещённого цвета")
+                            except Exception as _e:
+                                logger.warning(f"change_project final click check failed: {_e}")
+                            return True, f"Открыт проект через fallback и развернут: {dest}"
+                    except Exception as e2:
+                        return False, f"Не удалось открыть (fallback): {e2}"
+            else:
+                return False, "Смена проекта поддерживается только на macOS"
+        except Exception as e:
+            self.telemetry.last_error = f"change_project failed: {e}"
+            return False, f"Ошибка change: {e}"
 
 
 desktop_controller = DesktopController()

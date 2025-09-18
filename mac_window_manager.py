@@ -3,6 +3,13 @@ import os
 import subprocess
 from typing import List, Optional, Tuple
 
+# Quartz (CoreGraphics) как фоллбэк на случай, когда System Events не видит окна (например, полноэкранные/другие Spaces)
+try:
+    from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionAll, kCGNullWindowID  # type: ignore
+    _HAVE_QUARTZ = True
+except Exception:
+    _HAVE_QUARTZ = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -177,6 +184,29 @@ class MacWindowManager:
         except Exception:
             pass
 
+        # 6) Quartz CGWindowList fallback — сплошной системный список окон, фильтруем по владельцу app_name
+        # Полезно для полноэкранных окон и окон на других рабочих столах (Spaces)
+        if _HAVE_QUARTZ:
+            try:
+                infos = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID) or []
+                for info in infos:
+                    try:
+                        owner = info.get('kCGWindowOwnerName') or ''
+                        title = info.get('kCGWindowName') or ''
+                        layer = int(info.get('kCGWindowLayer') or 0)
+                        # интересны только обычные окна (layer==0) владельца Windsurf
+                        if not owner or not title or layer != 0:
+                            continue
+                        if owner.strip() != app_name:
+                            continue
+                        t = str(title).strip()
+                        if t and t not in seen:
+                            seen.add(t); results.append(t)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
         return results
 
     def list_window_titles_with_debug(self) -> Tuple[List[str], List[str]]:
@@ -334,6 +364,31 @@ class MacWindowManager:
         except Exception:
             pass
 
+        # Strategy 6: Quartz CGWindowList fallback (owner == app_name, layer==0)
+        if _HAVE_QUARTZ:
+            try:
+                infos = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID) or []
+                cg_titles: list[str] = []
+                for info in infos:
+                    try:
+                        owner = info.get('kCGWindowOwnerName') or ''
+                        title = info.get('kCGWindowName') or ''
+                        layer = int(info.get('kCGWindowLayer') or 0)
+                        if not owner or not title or layer != 0:
+                            continue
+                        if owner.strip() != app_name:
+                            continue
+                        nm = str(title).strip()
+                        if nm:
+                            cg_titles.append(nm)
+                            if nm not in seen:
+                                seen.add(nm); results.append(nm)
+                    except Exception:
+                        continue
+                dbg.append(f"cg(owner={app_name}) count={len(cg_titles)} titles={cg_titles[:6]}")
+            except Exception as _e:
+                dbg.append(f"cg error: {_e}")
+
         return results, dbg
 
     def focus_by_index(self, index_one_based: int) -> bool:
@@ -355,6 +410,59 @@ class MacWindowManager:
             if substr.lower() in (title or "").lower():
                 return self.focus_by_index(idx)
         return False
+
+    def focus_by_title_menu(self, substr: str) -> bool:
+        """Фокус окна через меню Window/Окно по подстроке заголовка (безопасно для полноэкранных окон).
+        Возвращает True при успешном выборе пункта меню.
+        """
+        try:
+            target = str(substr or "").strip()
+            if not target:
+                return False
+            # Экранируем кавычки в AppleScript
+            esc = target.replace('"', '\\"')
+            script = (
+                'set targetTitle to "' + esc + '"\n'
+                'tell application "System Events"\n'
+                '  tell process "Windsurf"\n'
+                '    try\n'
+                '      set winMenu to menu 1 of menu bar item "Window" of menu bar 1\n'
+                '      set mis to menu items of winMenu\n'
+                '      repeat with mi in mis\n'
+                '        try\n'
+                '          set nm to name of mi\n'
+                '          ignoring case\n'
+                '            if nm contains targetTitle then\n'
+                '              click mi\n'
+                '              return "ok"\n'
+                '            end if\n'
+                '          end ignoring\n'
+                '        end try\n'
+                '      end repeat\n'
+                '    end try\n'
+                '    try\n'
+                '      set winMenuRu to menu 1 of menu bar item "Окно" of menu bar 1\n'
+                '      set mis2 to menu items of winMenuRu\n'
+                '      repeat with mi2 in mis2\n'
+                '        try\n'
+                '          set nm2 to name of mi2\n'
+                '          ignoring case\n'
+                '            if nm2 contains targetTitle then\n'
+                '              click mi2\n'
+                '              return "ok"\n'
+                '            end if\n'
+                '          end ignoring\n'
+                '        end try\n'
+                '      end repeat\n'
+                '    end try\n'
+                '  end tell\n'
+                'end tell\n'
+                'return "fail"'
+            )
+            res = self._osascript(script)
+            return res.returncode == 0 and (res.stdout or "").strip().lower().startswith("ok")
+        except Exception:
+            return False
 
     def is_frontmost(self) -> bool:
         script = 'tell application "System Events" to get frontmost of process "Windsurf"'
@@ -386,3 +494,13 @@ class MacWindowManager:
         except Exception as e:
             logger.debug(f"get_front_window_bounds failed: {e}")
             return None
+
+    def get_front_window_title(self) -> Optional[str]:
+        """Возвращает заголовок активного окна Windsurf. None при ошибке."""
+        try:
+            res = self._osascript('tell application "System Events" to tell process "Windsurf" to get name of window 1')
+            if res.returncode == 0:
+                return (res.stdout or "").strip().strip('"')
+        except Exception as e:
+            logger.debug(f"get_front_window_title failed: {e}")
+        return None
