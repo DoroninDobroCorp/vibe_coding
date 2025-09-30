@@ -14,6 +14,19 @@ from selection import copy_from_right_panel
 from clipboard_utils import copy_to_clipboard as cb_copy, paste_from_clipboard_mac as cb_paste_mac
 from text_filter import clean_copied_text, extract_answer_by_prompt
 from PIL import ImageChops, ImageStat, Image
+
+# Новые модули рефакторинга
+from core.config import config
+from core.telemetry import Telemetry
+from core.sleep_utils import sleep_interruptible as _sleep_interruptible
+from core.pixel_utils import (
+    rgb_at as _rgb_at,
+    avg_rgb as _avg_rgb,
+    avg_rgb_via_screencapture as _avg_rgb_via_screencapture,
+    sample_rgb_consistent as _sample_rgb_consistent,
+    map_ready_pixel_xy,
+    measure_ready_pixel_rgb as _measure_ready_pixel_rgb,
+)
 try:
     import psutil  # для диагностики процессов Windsurf
 except Exception:
@@ -42,7 +55,8 @@ except ImportError:
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-WINDSURF_WINDOW_TITLE = os.getenv("WINDSURF_WINDOW_TITLE")
+# Используем config вместо прямого чтения из os.getenv
+WINDSURF_WINDOW_TITLE = config.WINDSURF_WINDOW_TITLE
 
 # Диагностика процессов Windsurf для /status
 def _scan_windsurf_processes():
@@ -70,332 +84,75 @@ def _scan_windsurf_processes():
             pass
     return procs
 
-# Параметры через ENV (с дефолтами)
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, default))
-    except Exception:
-        return default
+# === Используем централизованный config вместо прямого чтения ENV ===
+PASTE_RETRY_COUNT = config.PASTE_RETRY_COUNT
+COPY_RETRY_COUNT = config.COPY_RETRY_COUNT
+RESPONSE_WAIT_SECONDS = config.RESPONSE_WAIT_SECONDS
+KEY_DELAY_SECONDS = config.KEY_DELAY_SECONDS
+RESPONSE_MAX_WAIT_SECONDS = config.RESPONSE_MAX_WAIT_SECONDS
+RESPONSE_POLL_INTERVAL_SECONDS = config.RESPONSE_POLL_INTERVAL_SECONDS
+RESPONSE_STABLE_MIN_SECONDS = config.RESPONSE_STABLE_MIN_SECONDS
+USE_APPLESCRIPT_ON_MAC = config.USE_APPLESCRIPT_ON_MAC
+USE_FULLTEXT_STABILIZATION = config.USE_FULLTEXT_STABILIZATION
+USE_CPU_READY_DETECTION = config.USE_CPU_READY_DETECTION
+CPU_READY_THRESHOLD = config.CPU_READY_THRESHOLD
+CPU_READY_STABLE_SECONDS = config.CPU_READY_STABLE_SECONDS
+CPU_SAMPLE_INTERVAL_SECONDS = config.CPU_SAMPLE_INTERVAL_SECONDS
+USE_UI_BUTTON_DETECTION = config.USE_UI_BUTTON_DETECTION
+SEND_BTN_REGION_RIGHT = config.SEND_BTN_REGION_RIGHT
+SEND_BTN_REGION_BOTTOM = config.SEND_BTN_REGION_BOTTOM
+SEND_BTN_REGION_W = config.SEND_BTN_REGION_W
+SEND_BTN_REGION_H = config.SEND_BTN_REGION_H
+SEND_BTN_BLUE_DELTA = config.SEND_BTN_BLUE_DELTA
+SEND_BTN_WHITE_BRIGHT = config.SEND_BTN_WHITE_BRIGHT
+FRONTMOST_WAIT_SECONDS = config.FRONTMOST_WAIT_SECONDS
+FOCUS_RETRY_COUNT = config.FOCUS_RETRY_COUNT
+USE_VISUAL_STABILITY = config.USE_VISUAL_STABILITY
+VISUAL_REGION_TOP = config.VISUAL_REGION_TOP
+VISUAL_REGION_BOTTOM = config.VISUAL_REGION_BOTTOM
+VISUAL_SAMPLE_INTERVAL_SECONDS = config.VISUAL_SAMPLE_INTERVAL_SECONDS
+VISUAL_DIFF_THRESHOLD = config.VISUAL_DIFF_THRESHOLD
+VISUAL_STABLE_SECONDS = config.VISUAL_STABLE_SECONDS
+SAVE_VISUAL_DEBUG = config.SAVE_VISUAL_DEBUG
+SAVE_VISUAL_DIR = config.SAVE_VISUAL_DIR
+USE_COPY_SHORT_FALLBACK = config.USE_COPY_SHORT_FALLBACK
+RIGHT_CLICK_X_FRACTION = config.RIGHT_CLICK_X_FRACTION
+RIGHT_CLICK_Y_OFFSET = config.RIGHT_CLICK_Y_OFFSET
+ECHO_FILTER_ENABLED = config.ECHO_FILTER_ENABLED
+ECHO_PREFIX_LEN = config.ECHO_PREFIX_LEN
+ECHO_MAX_DELTA = config.ECHO_MAX_DELTA
+ECHO_LEN_RATIO = config.ECHO_LEN_RATIO
+USE_READY_PIXEL = config.USE_READY_PIXEL
+READY_PIXEL_REQUIRED = config.READY_PIXEL_REQUIRED
+TRIM_AFTER_PROMPT = config.TRIM_AFTER_PROMPT
+READY_PIXEL_X = config.READY_PIXEL_X
+READY_PIXEL_Y = config.READY_PIXEL_Y
+READY_PIXEL_R = config.READY_PIXEL_R
+READY_PIXEL_G = config.READY_PIXEL_G
+READY_PIXEL_B = config.READY_PIXEL_B
+READY_PIXEL_TOL = config.READY_PIXEL_TOL
+READY_PIXEL_TOL_PCT = config.READY_PIXEL_TOL_PCT
+READY_PIXEL_COORD_MODE = config.READY_PIXEL_COORD_MODE
+READY_PIXEL_DX = config.READY_PIXEL_DX
+READY_PIXEL_DY = config.READY_PIXEL_DY
+READY_PIXEL_PROBE_INTERVAL_SECONDS = config.READY_PIXEL_PROBE_INTERVAL_SECONDS
+READY_PIXEL_AVG_K = config.READY_PIXEL_AVG_K
+READY_PIXEL_REQUIRE_TRANSITION = config.READY_PIXEL_REQUIRE_TRANSITION
+READY_PIXEL_STABLE_SECONDS = config.READY_PIXEL_STABLE_SECONDS
+READY_PIXEL_TRANSITION_TIMEOUT_SECONDS = config.READY_PIXEL_TRANSITION_TIMEOUT_SECONDS
+CLICK_ABS_X = config.CLICK_ABS_X
+CLICK_ABS_Y = config.CLICK_ABS_Y
+SAVE_READY_HYPOTHESES = config.SAVE_READY_HYPOTHESES
+SAVE_READY_ONLY_ON_MATCH = config.SAVE_READY_ONLY_ON_MATCH
+ENV_RELOAD_INTERVAL_SECONDS = config.ENV_RELOAD_INTERVAL_SECONDS
+WSMODEL_RESTORE_CLIPBOARD = config.WSMODEL_RESTORE_CLIPBOARD
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except Exception:
-        return default
+# === Дублирующиеся функции удалены — используем core.pixel_utils ===
+# map_ready_pixel_xy, _rgb_at, _avg_rgb, _avg_rgb_via_screencapture, _sanitize_k,
+# _sample_rgb_consistent, _measure_ready_pixel_rgb
+# теперь импортируются из core.pixel_utils
 
-PASTE_RETRY_COUNT = _env_int("PASTE_RETRY_COUNT", 2)
-COPY_RETRY_COUNT = _env_int("COPY_RETRY_COUNT", 2)
-RESPONSE_WAIT_SECONDS = _env_float("RESPONSE_WAIT_SECONDS", 7.0)
-KEY_DELAY_SECONDS = _env_float("KEY_DELAY_SECONDS", 0.2)
-RESPONSE_MAX_WAIT_SECONDS = _env_float("RESPONSE_MAX_WAIT_SECONDS", 45.0)
-RESPONSE_POLL_INTERVAL_SECONDS = _env_float("RESPONSE_POLL_INTERVAL_SECONDS", 0.8)
-RESPONSE_STABLE_MIN_SECONDS = _env_float("RESPONSE_STABLE_MIN_SECONDS", 1.6)
-USE_APPLESCRIPT_ON_MAC = os.getenv("USE_APPLESCRIPT_ON_MAC", "1") not in ("0", "false", "False")
-USE_FULLTEXT_STABILIZATION = os.getenv("USE_FULLTEXT_STABILIZATION", "0") not in ("0", "false", "False")
-USE_CPU_READY_DETECTION = os.getenv("USE_CPU_READY_DETECTION", "1") not in ("0", "false", "False")
-CPU_READY_THRESHOLD = _env_float("CPU_READY_THRESHOLD", 6.0)
-CPU_READY_STABLE_SECONDS = _env_float("CPU_READY_STABLE_SECONDS", 20.0)
-CPU_SAMPLE_INTERVAL_SECONDS = _env_float("CPU_SAMPLE_INTERVAL_SECONDS", 1.0)
-USE_UI_BUTTON_DETECTION = os.getenv("USE_UI_BUTTON_DETECTION", "0") not in ("0", "false", "False")
-SEND_BTN_REGION_RIGHT = _env_int("SEND_BTN_REGION_RIGHT", 84)
-SEND_BTN_REGION_BOTTOM = _env_int("SEND_BTN_REGION_BOTTOM", 58)
-SEND_BTN_REGION_W = _env_int("SEND_BTN_REGION_W", 54)
-SEND_BTN_REGION_H = _env_int("SEND_BTN_REGION_H", 36)
-SEND_BTN_BLUE_DELTA = _env_int("SEND_BTN_BLUE_DELTA", 40)
-SEND_BTN_WHITE_BRIGHT = _env_int("SEND_BTN_WHITE_BRIGHT", 200)
-FRONTMOST_WAIT_SECONDS = _env_float("FRONTMOST_WAIT_SECONDS", 3.0)
-FOCUS_RETRY_COUNT = _env_int("FOCUS_RETRY_COUNT", 3)
-
-# Визуальная стабилизация (macOS): детекция «остановки движения» в области ответа
-USE_VISUAL_STABILITY = os.getenv("USE_VISUAL_STABILITY", "1") not in ("0", "false", "False")
-VISUAL_REGION_TOP = _env_int("VISUAL_REGION_TOP", 100)
-VISUAL_REGION_BOTTOM = _env_int("VISUAL_REGION_BOTTOM", 150)
-VISUAL_SAMPLE_INTERVAL_SECONDS = _env_float("VISUAL_SAMPLE_INTERVAL_SECONDS", 0.5)
-VISUAL_DIFF_THRESHOLD = _env_float("VISUAL_DIFF_THRESHOLD", 5.0)
-VISUAL_STABLE_SECONDS = _env_float("VISUAL_STABLE_SECONDS", 2.0)
-SAVE_VISUAL_DEBUG = os.getenv("SAVE_VISUAL_DEBUG", "0") not in ("0", "false", "False")
-SAVE_VISUAL_DIR = os.getenv("SAVE_VISUAL_DIR", "debug")
-USE_COPY_SHORT_FALLBACK = os.getenv("USE_COPY_SHORT_FALLBACK", "1") not in ("0", "false", "False")
-RIGHT_CLICK_X_FRACTION = _env_float("RIGHT_CLICK_X_FRACTION", 0.5)  # в пределах правой трети (0..1)
-RIGHT_CLICK_Y_OFFSET = _env_int("RIGHT_CLICK_Y_OFFSET", 80)  # пикселей ниже VISUAL_REGION_TOP
-ECHO_FILTER_ENABLED = os.getenv("ECHO_FILTER_ENABLED", "1") not in ("0", "false", "False")
-ECHO_PREFIX_LEN = _env_int("ECHO_PREFIX_LEN", 24)
-ECHO_MAX_DELTA = _env_int("ECHO_MAX_DELTA", 64)
-ECHO_LEN_RATIO = _env_float("ECHO_LEN_RATIO", 1.4)
-USE_READY_PIXEL = os.getenv("USE_READY_PIXEL", "1") not in ("0", "false", "False")
-READY_PIXEL_REQUIRED = os.getenv("READY_PIXEL_REQUIRED", "0") not in ("0", "false", "False")
-TRIM_AFTER_PROMPT = os.getenv("TRIM_AFTER_PROMPT", "1") not in ("0", "false", "False")
-READY_PIXEL_X = _env_int("READY_PIXEL_X", -1)
-READY_PIXEL_Y = _env_int("READY_PIXEL_Y", -1)
-READY_PIXEL_R = _env_int("READY_PIXEL_R", 225)
-READY_PIXEL_G = _env_int("READY_PIXEL_G", 220)
-READY_PIXEL_B = _env_int("READY_PIXEL_B", 204)
-READY_PIXEL_TOL = _env_int("READY_PIXEL_TOL", 12)
-READY_PIXEL_TOL_PCT = _env_float("READY_PIXEL_TOL_PCT", -1.0)  # если >=0, использовать процентную толерантность
-READY_PIXEL_COORD_MODE = os.getenv("READY_PIXEL_COORD_MODE", "top").strip().lower()
-READY_PIXEL_DX = _env_int("READY_PIXEL_DX", 0)
-READY_PIXEL_DY = _env_int("READY_PIXEL_DY", 0)
-READY_PIXEL_PROBE_INTERVAL_SECONDS = _env_float("READY_PIXEL_PROBE_INTERVAL_SECONDS", 5.0)
-READY_PIXEL_AVG_K = _env_int("READY_PIXEL_AVG_K", 1)
-# Дополнительные требования к детекции опорного пикселя
-READY_PIXEL_REQUIRE_TRANSITION = os.getenv("READY_PIXEL_REQUIRE_TRANSITION", "1") not in ("0", "false", "False")
-READY_PIXEL_STABLE_SECONDS = _env_float("READY_PIXEL_STABLE_SECONDS", 0.8)
-READY_PIXEL_TRANSITION_TIMEOUT_SECONDS = _env_float("READY_PIXEL_TRANSITION_TIMEOUT_SECONDS", 25.0)
-CLICK_ABS_X = _env_int("CLICK_ABS_X", -1)
-CLICK_ABS_Y = _env_int("CLICK_ABS_Y", -1)
-
-# Отладка опорного пикселя: по умолчанию сохраняем только при совпадении и не сохраняем гипотезы
-SAVE_READY_HYPOTHESES = os.getenv("SAVE_READY_HYPOTHESES", "0") not in ("0", "false", "False")
-SAVE_READY_ONLY_ON_MATCH = os.getenv("SAVE_READY_ONLY_ON_MATCH", "1") not in ("0", "false", "False")
-# Периодический перезахват .env во время ожидания (секунды)
-ENV_RELOAD_INTERVAL_SECONDS = _env_float("ENV_RELOAD_INTERVAL_SECONDS", 2.0)
-READY_PIXEL_RELOAD_ENV = os.getenv("READY_PIXEL_RELOAD_ENV", "0") not in ("0", "false", "False")
-
-# UI-модель: подтверждающий клик вместо Enter и политика буфера обмена
-WSMODEL_CONFIRM_CLICK_X = _env_int("WSMODEL_CONFIRM_CLICK_X", 1040)
-WSMODEL_CONFIRM_CLICK_Y = _env_int("WSMODEL_CONFIRM_CLICK_Y", 720)
-WSMODEL_RESTORE_CLIPBOARD = os.getenv("WSMODEL_RESTORE_CLIPBOARD", "1") not in ("0", "false", "False")
-
-
-def map_ready_pixel_xy(rp_x: int, rp_y: int, rp_mode: str | None = None, rp_dx: int | None = None, rp_dy: int | None = None) -> tuple[int, int]:
-    """Маппинг координат опорного пикселя в экранные координаты согласно режиму.
-    Если параметры не заданы, берутся из ENV.
-    """
-    if rp_mode is None:
-        rp_mode = os.getenv("READY_PIXEL_COORD_MODE", READY_PIXEL_COORD_MODE).strip().lower()
-    if rp_dx is None:
-        rp_dx = int(os.getenv("READY_PIXEL_DX", str(READY_PIXEL_DX)))
-    if rp_dy is None:
-        rp_dy = int(os.getenv("READY_PIXEL_DY", str(READY_PIXEL_DY)))
-
-    x2, y2 = int(rp_x) + int(rp_dx), int(rp_y) + int(rp_dy)
-    if rp_mode == 'flipy':
-        # инвертируем только по режиму, без ограничения экраном
-        try:
-            _, sh = pyautogui.size()
-        except Exception:
-            sh = 0
-        return x2, (sh - 1 - y2) if sh else y2
-    if rp_mode == 'top2x':
-        return x2 * 2, y2 * 2
-    if rp_mode == 'flipy2x':
-        try:
-            _, sh = pyautogui.size()
-        except Exception:
-            sh = 0
-        return x2 * 2, ((sh * 2 - 1) - y2 * 2) if sh else (y2 * 2)
-    # default 'top'
-    return x2, y2
-
-def _rgb_at(x: int, y: int):
-    """Надёжное чтение цвета в координатах экрана (top-origin)."""
-    try:
-        r, g, b = pyautogui.pixel(int(x), int(y))
-        return int(r), int(g), int(b)
-    except Exception:
-        try:
-            img = pyautogui.screenshot(region=(int(x), int(y), 1, 1))
-            p = img.getpixel((0, 0))
-            if isinstance(p, tuple) and len(p) >= 3:
-                return int(p[0]), int(p[1]), int(p[2])
-            v = int(p[0] if isinstance(p, tuple) else p)
-            return v, v, v
-        except Exception:
-            return 0, 0, 0
-
-def _sanitize_k(k: int) -> int:
-    try:
-        k = int(k)
-    except Exception:
-        k = 1
-    if k < 1:
-        k = 1
-    if k > 9:
-        k = 9
-    if k % 2 == 0:
-        k += 1
-    return k
-
-def _avg_rgb(x: int, y: int, k: int) -> tuple[int, int, int]:
-    """Усреднение по kxk вокруг (x,y) прямыми вызовами pixel()."""
-    k = _sanitize_k(k)
-    if k == 1:
-        return _rgb_at(x, y)
-    r = k // 2
-    acc = [0, 0, 0]
-    cnt = 0
-    try:
-        sw, sh = pyautogui.size()
-    except Exception:
-        sw = sh = 0
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            xi = int(x + dx)
-            yi = int(y + dy)
-            if sw and sh:
-                if xi < 0 or yi < 0 or xi >= sw or yi >= sh:
-                    xi = max(0, min(sw - 1, xi))
-                    yi = max(0, min(sh - 1, yi))
-            try:
-                pr, pg, pb = pyautogui.pixel(xi, yi)
-                acc[0] += int(pr); acc[1] += int(pg); acc[2] += int(pb)
-                cnt += 1
-            except Exception:
-                pass
-    if cnt <= 0:
-        return _rgb_at(x, y)
-    return acc[0] // cnt, acc[1] // cnt, acc[2] // cnt
-
-def _avg_rgb_via_screencapture(x: int, y: int, k: int) -> tuple[int, int, int]:
-    """Усреднение по kxk с использованием 'screencapture -R' (устойчиво на ретине/мульти-мониторе)."""
-    k = _sanitize_k(k)
-    r = k // 2
-    rx = int(x - r)
-    ry = int(y - r)
-    cw = int(k)
-    ch = int(k)
-    tmp_path = None
-    img = None
-    try:
-        os.makedirs(SAVE_VISUAL_DIR, exist_ok=True)
-        tmp_path = os.path.join(SAVE_VISUAL_DIR, f"_rp_tmp_{int(time.time()*1000)}.png")
-        cmd = ["screencapture", "-x", "-R", f"{rx},{ry},{cw},{ch}", tmp_path]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode == 0 and os.path.exists(tmp_path):
-            try:
-                img = Image.open(tmp_path).convert('RGB')
-            except Exception:
-                img = None
-    except Exception:
-        img = None
-    finally:
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-    if img is None:
-        # Фоллбэк — pyautogui.screenshot
-        try:
-            img = pyautogui.screenshot(region=(rx, ry, cw, ch)).convert('RGB')
-        except Exception:
-            return _rgb_at(x, y)
-    acc_r = acc_g = acc_b = 0
-    cnt = 0
-    try:
-        for iy in range(img.height):
-            for ix in range(img.width):
-                pr, pg, pb = img.getpixel((ix, iy))
-                acc_r += int(pr); acc_g += int(pg); acc_b += int(pb)
-                cnt += 1
-    except Exception:
-        return _rgb_at(x, y)
-    if cnt <= 0:
-        return _rgb_at(x, y)
-    return acc_r // cnt, acc_g // cnt, acc_b // cnt
-
-def _sample_rgb_consistent(x: int, y: int, avg_k: int) -> tuple[int, int, int]:
-    """Сэмплирование цвета согласованно с color_pipette: по умолчанию через screencapture, с усреднением."""
-    try:
-        return _avg_rgb_via_screencapture(x, y, avg_k)
-    except Exception:
-        try:
-            return _avg_rgb(x, y, avg_k)
-        except Exception:
-            return _rgb_at(x, y)
-
-def _pick_ready_src(default: str = 'cap') -> str:
-    s = (os.getenv('READY_PIXEL_SRC') or default).strip().lower()
-    if s not in ('auto', 'cap', 'dir'):
-        s = default
-    return s
-
-def _measure_ready_pixel_rgb(x: int, y: int, avg_k: int, target: tuple[int, int, int] | None = None) -> tuple[tuple[int, int, int], str]:
-    """Измерить RGB в точке (x,y) для READY_PIXEL в соответствии с READY_PIXEL_SRC={cap|dir|auto}.
-    Возвращает ((r,g,b), used_src).
-    При auto выбирается источник, дающий меньшую дельту до target; при отсутствии target — предпочитаем cap,
-    но если cap выглядит как подозрительно белый (255,255,255), берём dir.
-    """
-    src = _pick_ready_src('cap')
-    avg_k = max(1, int(avg_k))
-    if src == 'cap':
-        return (_avg_rgb_via_screencapture(x, y, avg_k), 'cap')
-    if src == 'dir':
-        return (_avg_rgb(x, y, avg_k), 'dir')
-    # auto
-    rgb_cap = _avg_rgb_via_screencapture(x, y, avg_k)
-    rgb_dir = _avg_rgb(x, y, avg_k)
-    used = 'cap'
-    rgb = rgb_cap
-    if target and isinstance(target, tuple) and len(target) >= 3:
-        d_cap = abs(int(rgb_cap[0]) - int(target[0])) + abs(int(rgb_cap[1]) - int(target[1])) + abs(int(rgb_cap[2]) - int(target[2]))
-        d_dir = abs(int(rgb_dir[0]) - int(target[0])) + abs(int(rgb_dir[1]) - int(target[1])) + abs(int(rgb_dir[2]) - int(target[2]))
-        if d_dir < d_cap:
-            rgb, used = rgb_dir, 'dir'
-        else:
-            rgb, used = rgb_cap, 'cap'
-    else:
-        def _is_white(c: tuple[int, int, int]) -> bool:
-            try:
-                return int(c[0]) >= 254 and int(c[1]) >= 254 and int(c[2]) >= 254
-            except Exception:
-                return False
-        if _is_white(rgb_cap) and not _is_white(rgb_dir):
-            rgb, used = rgb_dir, 'dir'
-        else:
-            rgb, used = rgb_cap, 'cap'
-    return (rgb, used)
-
-class _Telemetry:
-    def __init__(self):
-        self.success_sends = 0
-        self.failed_sends = 0
-        self.last_error = None
-        self.last_platform = platform.system()
-        self.last_paste_strategy = None  # 'direct' | 'clear_then_paste'
-        self.last_copy_method = None     # 'short' | 'full'
-        self.last_copy_length = 0
-        self.last_copy_is_echo = False
-        self.response_wait_loops = 0
-        self.response_ready_time = 0.0
-        self.response_stabilized = False
-        self.last_ui_button = None  # 'send' | 'stop' | 'unknown'
-        self.last_ui_avg_color = None  # (r,g,b)
-        self.last_full_copy_length = 0
-        self.response_stabilized_by = None  # 'short' | 'full' | None
-        self.cpu_quiet_seconds = 0.0
-        self.cpu_last_total_percent = 0.0
-        self.last_visual_region = None  # (rx, ry, rw, rh)
-        self.last_click_xy = None  # (x, y)
-        self.last_ready_pixel = None  # {'x':..,'y':..,'rgb':(r,g,b),'match':bool,'delta':(dr,dg,db)}
-        self.last_model_set = None  # UI: last requested model name
-
-    def as_dict(self):
-        return {
-            "success_sends": self.success_sends,
-            "failed_sends": self.failed_sends,
-            "last_error": self.last_error,
-            "platform": self.last_platform,
-            "windows_automation": WINDOWS_AUTOMATION_AVAILABLE,
-            "windsurf_pids": _scan_windsurf_processes(),
-            "last_paste_strategy": self.last_paste_strategy,
-            "last_copy_method": self.last_copy_method,
-            "last_copy_length": self.last_copy_length,
-            "last_copy_is_echo": self.last_copy_is_echo,
-            "response_wait_loops": self.response_wait_loops,
-            "response_ready_time": self.response_ready_time,
-            "response_stabilized": self.response_stabilized,
-            "last_ui_button": self.last_ui_button,
-            "last_ui_avg_color": self.last_ui_avg_color,
-            "last_full_copy_length": self.last_full_copy_length,
-            "response_stabilized_by": self.response_stabilized_by,
-            "cpu_quiet_seconds": self.cpu_quiet_seconds,
-            "cpu_last_total_percent": self.cpu_last_total_percent,
-            "last_visual_region": self.last_visual_region,
-            "last_click_xy": self.last_click_xy,
-            "last_ready_pixel": self.last_ready_pixel,
-            "last_model_set": self.last_model_set,
-        }
+# Telemetry теперь импортируется из core.telemetry вместо локального класса
 
 
 class DesktopController:
@@ -403,7 +160,7 @@ class DesktopController:
         self.is_ready = False
         pyautogui.FAILSAFE = False
         pyautogui.PAUSE = max(0.1, KEY_DELAY_SECONDS)
-        self.telemetry = _Telemetry()
+        self.telemetry = Telemetry()
         self._mac_manager = MacWindowManager() if platform.system() == "Darwin" else None
 
     def _lcp_suffix(self, a: str, b: str) -> str:
@@ -616,7 +373,7 @@ class DesktopController:
                             "READY_PIXEL проверка: used_xy=(%d,%d) цвет=(%d,%d,%d) не подходит; жду %.1fs",
                             sx, sy, int(pr), int(pg), int(pb), READY_PIXEL_PROBE_INTERVAL_SECONDS
                         )
-                        time.sleep(READY_PIXEL_PROBE_INTERVAL_SECONDS)
+                        _sleep_interruptible(float(READY_PIXEL_PROBE_INTERVAL_SECONDS))
                         continue
                     # Тут match == True
                     if READY_PIXEL_REQUIRE_TRANSITION and not seen_nonmatch:
@@ -624,7 +381,7 @@ class DesktopController:
                         # Если задан таймаут перехода и он истёк — либо принимаем (если timeout<=0 не задан), либо продолжаем ждать
                         if transition_deadline is not None and now_ts >= transition_deadline:
                             logger.info("READY_PIXEL: переход non-match->match не зафиксирован до таймаута, продолжаю ожидать совпадение...")
-                            time.sleep(READY_PIXEL_PROBE_INTERVAL_SECONDS)
+                            _sleep_interruptible(float(READY_PIXEL_PROBE_INTERVAL_SECONDS))
                             continue
                     # Стабильность совпадения
                     if match_started_at is None:
@@ -632,7 +389,7 @@ class DesktopController:
                     stable_for = now_ts - match_started_at
                     if stable_for < max(0.0, READY_PIXEL_STABLE_SECONDS):
                         logger.info("READY_PIXEL: совпадение, но ждём стабильность %.1fs (уже %.2fs)", READY_PIXEL_STABLE_SECONDS, stable_for)
-                        time.sleep(READY_PIXEL_PROBE_INTERVAL_SECONDS)
+                        _sleep_interruptible(float(READY_PIXEL_PROBE_INTERVAL_SECONDS))
                         continue
                     # Все условия выполнены
                     ready_by = 'ready_pixel'
@@ -733,7 +490,8 @@ class DesktopController:
                 logger.info("Readiness satisfied by=%s, proceeding to copy", ready_by)
                 break
 
-            time.sleep(RESPONSE_POLL_INTERVAL_SECONDS)
+            # Короткий прерывный сон, чтобы Ctrl+C срабатывал мгновенно
+            _sleep_interruptible(max(0.05, float(RESPONSE_POLL_INTERVAL_SECONDS)))
 
         # Финальный сбор текста
         copied_text = ""
@@ -1204,6 +962,18 @@ class DesktopController:
                         pyperclip.copy(raw_clip or "")
                 except Exception as _e:
                     logger.debug(f"clean/copy failed: {_e}")
+                # Диагностика финального ответа
+                try:
+                    final_len = int(self.telemetry.last_copy_length or 0)
+                    full_len = int(self.telemetry.last_full_copy_length or 0)
+                    method = self.telemetry.last_copy_method or '—'
+                    echo_flag = bool(self.telemetry.last_copy_is_echo)
+                    logger.info(
+                        "Final response prepared: method=%s cleaned_len=%d full_len=%d echo=%s",
+                        method, final_len, full_len, echo_flag,
+                    )
+                except Exception:
+                    pass
                 if not copied:
                     logger.warning("Ответ не получен или выглядит как эхо (macOS)")
 
@@ -1342,8 +1112,11 @@ class DesktopController:
 
     def get_diagnostics(self):
         """Диагностика и телеметрия для /status"""
-        d = self.telemetry.as_dict()
+        d = self.telemetry.to_dict()
         d.update({
+            "platform": platform.system(),
+            "windows_automation": WINDOWS_AUTOMATION_AVAILABLE,
+            "windsurf_pids": _scan_windsurf_processes(),
             "RESPONSE_WAIT_SECONDS": RESPONSE_WAIT_SECONDS,
             "RESPONSE_MAX_WAIT_SECONDS": RESPONSE_MAX_WAIT_SECONDS,
             "RESPONSE_POLL_INTERVAL_SECONDS": RESPONSE_POLL_INTERVAL_SECONDS,

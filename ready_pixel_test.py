@@ -3,7 +3,7 @@ import os
 import time
 from dotenv import load_dotenv
 import pyautogui
-from windsurf_controller import map_ready_pixel_xy, _measure_ready_pixel_rgb, _rgb_at
+from core.pixel_utils import map_ready_pixel_xy, measure_ready_pixel_rgb, rgb_at
 
 
 def sample_once():
@@ -24,9 +24,9 @@ def sample_once():
     sx, sy = map_ready_pixel_xy(rp_x, rp_y, rp_mode, rp_dx, rp_dy)
     # Консистентная выборка (как в color_pipette / windsurf_controller) с авто-выбором источника
     avg_k = int(os.getenv('READY_PIXEL_AVG_K', '3'))
-    (pr, pg, pb), used_src = _measure_ready_pixel_rgb(int(sx), int(sy), max(1, avg_k), (rp_r, rp_g, rp_b))
+    (pr, pg, pb), used_src = measure_ready_pixel_rgb(int(sx), int(sy), max(1, avg_k), (rp_r, rp_g, rp_b))
     # Параллельно измерим "direct 1x1" для сравнения
-    dr1, dg1, db1 = _rgb_at(int(sx), int(sy))
+    dr1, dg1, db1 = rgb_at(int(sx), int(sy))
     dr, dg, db = abs(int(pr) - rp_r), abs(int(pg) - rp_g), abs(int(pb) - rp_b)
     if rp_tol_pct is not None and rp_tol_pct >= 0:
         rel = (dr + dg + db) / (3.0 * 255.0) * 100.0

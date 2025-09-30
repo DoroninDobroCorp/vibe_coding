@@ -675,6 +675,18 @@ async def handle_message(message: types.Message):
         if copied_response is None:
             import pyperclip
             copied_response = pyperclip.paste()
+        # Диагностика ответа из буфера
+        try:
+            cr_len = len((copied_response or "").strip())
+            method = (diag or {}).get("last_copy_method")
+            echo_flag = bool((diag or {}).get("last_copy_is_echo"))
+            preview = (copied_response or "").strip()[:160]
+            logger.info(
+                "[Bot] clipboard response: len=%d method=%s echo=%s preview=%s",
+                cr_len, method, echo_flag, preview,
+            )
+        except Exception:
+            pass
 
         # Фильтрация эхо: если diag говорит, что это эхо, не отправляем
         response_is_echo = False
@@ -698,6 +710,16 @@ async def handle_message(message: types.Message):
                 reply_markup=main_keyboard,
             )
         else:
+            try:
+                logger.info(
+                    "[Bot] suppress send: empty=%s echo=%s len=%d method=%s",
+                    not bool(copied_response and copied_response.strip()),
+                    response_is_echo,
+                    len((copied_response or "").strip()),
+                    (diag or {}).get("last_copy_method"),
+                )
+            except Exception:
+                pass
             echo_note = "\nПричина: получено эхо исходного запроса — ответа еще нет." if response_is_echo else ""
             hint = (
                 "Попробуйте: увеличить RESPONSE_WAIT_SECONDS, повторить запрос, или сфокусировать окно Windsurf."
